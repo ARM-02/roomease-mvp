@@ -1,63 +1,53 @@
 import streamlit as st
-import sqlite3, uuid, os
+import uuid, os
 from datetime import datetime
 
-# ------------------ SQLite (PII ONLY: name + user_id) ------------------
-DB_PATH = "app.db"
+# ====================== Supabase (PII store) ======================
+from supabase import create_client
 
-def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+def get_supabase():
+    try:
+        url = os.environ["SUPABASE_URL"]
+        key = os.environ["SUPABASE_KEY"]
+    except KeyError as e:
+        st.error(f"Missing secret: {e}. Add SUPABASE_URL and SUPABASE_KEY in Streamlit → ⋮ → Edit secrets.")
+        st.stop()
+    return create_client(url, key)
 
-def init_db():
-    with get_conn() as conn:
-        # users table: store only identity info (no text answers here)
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_uuid TEXT UNIQUE NOT NULL,
-          name TEXT NOT NULL,
-          user_id TEXT NOT NULL,
-          created_at TEXT NOT NULL
-        )
-        """)
-        # NOTE: no responses table anymore — answers live in Chroma
+supabase = get_supabase()
 
 def save_user(name: str, user_id: str) -> str:
-    """Insert minimal PII into SQLite and return the generated UUID."""
+    """Create a user record in Supabase and return a fresh user_uuid."""
     user_uuid = str(uuid.uuid4())
     created = datetime.utcnow().isoformat()
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO users (user_uuid, name, user_id, created_at) VALUES (?, ?, ?, ?)",
-            (user_uuid, name, user_id, created),
-        )
+    # Table schema expected in Supabase:
+    # users(user_uuid uuid unique, user_id text unique, name text, created_at timestamp default now())
+    res = supabase.table("users").insert({
+        "user_uuid": user_uuid,
+        "user_id": user_id,
+        "name": name,
+        "created_at": created
+    }).execute()
+    # You could check res.data / res.error here if you want stricter handling
     return user_uuid
 
 def fetch_recent_users(limit: int = 5):
-    """Read back most recent users to confirm persistence."""
-    with get_conn() as conn:
-        cur = conn.execute("""
-            SELECT user_uuid, name, user_id, created_at
-            FROM users
-            ORDER BY id DESC
-            LIMIT ?
-        """, (limit,))
-        cols = [c[0] for c in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+    res = supabase.table("users").select("user_uuid,name,user_id,created_at").order("created_at", desc=True).limit(limit).execute()
+    return res.data or []
 
-# ------------------ Embeddings + Chroma ------------------
+# ====================== Chroma (embeddings + matching) ======================
 from sentence_transformers import SentenceTransformer
 import chromadb
 
 @st.cache_resource(show_spinner=False)
 def load_embed_model():
+    # Downloads once per session in the Cloud container
     return SentenceTransformer("all-MiniLM-L6-v2")
 
 @st.cache_resource(show_spinner=False)
 def get_chroma_client():
-    # local persistent path inside the Streamlit runtime (ephemeral on Cloud)
+    # Local persistent path inside container (ephemeral across redeploys).
+    # Swap to Chroma Cloud by replacing this with chromadb.HttpClient(...)
     return chromadb.PersistentClient(path=".chroma")
 
 def get_collections(client):
@@ -67,10 +57,7 @@ def get_collections(client):
     return roommates, apartments, user_profiles
 
 def profile_text_from_answers(name: str, answers: dict) -> str:
-    """
-    Turn free-text answers into a compact profile string.
-    Do NOT include user_id (PII) in this text; it goes to Chroma as non-PII.
-    """
+    # Do NOT include user_id or other PII — just the content that describes preferences.
     blocks = [
         f"ideal_weekday: {answers['q1']}",
         f"living_space: {answers['q2']}",
@@ -83,17 +70,19 @@ def profile_text_from_answers(name: str, answers: dict) -> str:
 
 def embed_text(text: str) -> list[float]:
     model = load_embed_model()
-    vec = model.encode([text], normalize_embeddings=True)[0]  # 384-d
+    vec = model.encode([text], normalize_embeddings=True)[0]  # 384-dim vector
     return vec.tolist()
 
 def seed_demo_if_empty(roommates, apartments):
-    # Seed roommates
+    # Seed 3 roommates
     try:
         r_count = roommates.count()
         a_count = apartments.count()
     except Exception:
-        r_count = len(roommates.peek().get("ids", [])) if roommates.peek().get("ids") else 0
-        a_count = len(apartments.peek().get("ids", [])) if apartments.peek().get("ids") else 0
+        peek_r = roommates.peek()
+        peek_a = apartments.peek()
+        r_count = len(peek_r.get("ids", []) or [])
+        a_count = len(peek_a.get("ids", []) or [])
 
     if r_count == 0:
         demo_roommates = [
@@ -104,7 +93,10 @@ def seed_demo_if_empty(roommates, apartments):
         ids, docs, metas, vecs = [], [], [], []
         for i, rm in enumerate(demo_roommates):
             text = f"name={rm['name']} quiet={rm['quiet']} study={rm['study']} guests={rm['guests']}"
-            ids.append(f"rm_{i}"); docs.append(text); metas.append(rm); vecs.append(embed_text(text))
+            ids.append(f"rm_{i}")
+            docs.append(text)
+            metas.append(rm)
+            vecs.append(embed_text(text))
         roommates.upsert(ids=ids, documents=docs, metadatas=metas, embeddings=vecs)
 
     if a_count == 0:
@@ -116,13 +108,15 @@ def seed_demo_if_empty(roommates, apartments):
         ids, docs, metas, vecs = [], [], [], []
         for i, ap in enumerate(demo_apartments):
             text = f"neighborhood={ap['neighborhood']} rent={ap['rent']} quiet={ap['quiet']}"
-            ids.append(f"ap_{i}"); docs.append(text); metas.append(ap); vecs.append(embed_text(text))
+            ids.append(f"ap_{i}")
+            docs.append(text)
+            metas.append(ap)
+            vecs.append(embed_text(text))
         apartments.upsert(ids=ids, documents=docs, metadatas=metas, embeddings=vecs)
 
 def query_matches(roommates, apartments, user_vec):
     r = roommates.query(query_embeddings=[user_vec], n_results=3, include=["metadatas","distances","ids"])  # type: ignore
     a = apartments.query(query_embeddings=[user_vec], n_results=3, include=["metadatas","distances","ids"])  # type: ignore
-
     roommate_hits = [
         {"id": rid, **meta, "distance": dist}
         for rid, meta, dist in zip(r["ids"][0], r["metadatas"][0], r["distances"][0])
@@ -133,22 +127,19 @@ def query_matches(roommates, apartments, user_vec):
     ]
     if not roommate_hits or not apt_hits:
         return None
-
     best_rm = min(roommate_hits, key=lambda x: x["distance"])
     best_ap = min(apt_hits, key=lambda x: x["distance"])
     similarity = 1.0 - (best_rm["distance"] + best_ap["distance"]) / 2.0
     return {"roommate": best_rm, "apartment": best_ap, "similarity": similarity}
 
-# ------------------ Streamlit UI ------------------
-st.set_page_config(page_title="RoomEase+ (Chroma demo)", page_icon="🏡", layout="centered")
-st.title("🏡 RoomEase+ — Save (PII) + Embed (answers) + Match")
-
-init_db()
+# ====================== UI ======================
+st.set_page_config(page_title="RoomEase+ (Supabase + Chroma)", page_icon="🏡", layout="centered")
+st.title("🏡 RoomEase+ — PII in Supabase, answers in Chroma, real match")
 
 with st.form("onboarding_form"):
     st.subheader("1) Your info")
     name = st.text_input("Name")
-    user_id = st.text_input("User ID")  # renamed from Student ID
+    user_id = st.text_input("User ID")  # your external/student ID (PII)
 
     st.subheader("2) Personality (free-text answers)")
     q1 = st.text_area("1) Describe your ideal weekday.", height=80)
@@ -160,7 +151,7 @@ with st.form("onboarding_form"):
     submitted = st.form_submit_button("Save (PII), embed answers, and see my match")
 
 if submitted:
-    # Validate
+    # ---- Validate inputs ----
     if not name or not user_id:
         st.error("Please fill name and user ID.")
         st.stop()
@@ -169,14 +160,14 @@ if submitted:
         st.error("Please answer all five questions (free-text).")
         st.stop()
 
-    # 1) Save ONLY identity to SQLite
+    # ---- 1) Save ONLY PII to Supabase ----
     user_uuid = save_user(name, user_id)
 
-    # 2) Build profile text & embed (answers do NOT go to SQLite)
+    # ---- 2) Convert answers → text profile → embedding ----
     profile_text = profile_text_from_answers(name, answers)
     user_vec = embed_text(profile_text)
 
-    # 3) Chroma: connect, seed demo data if needed, upsert user profile
+    # ---- 3) Chroma: upsert user + seed collections if empty ----
     client = get_chroma_client()
     roommates, apartments, user_profiles = get_collections(client)
     seed_demo_if_empty(roommates, apartments)
@@ -185,10 +176,10 @@ if submitted:
         ids=[user_uuid],
         documents=[profile_text],
         embeddings=[user_vec],
-        metadatas=[{"name": name, "user_id": user_id}]  # OK to remove PII here if you prefer
+        metadatas=[{"name": name, "user_id": user_id}]  # you can drop PII here if you prefer
     )
 
-    # 4) Query for similar roommates + apartments & display
+    # ---- 4) Query for a match ----
     match = query_matches(roommates, apartments, user_vec)
     if not match:
         st.warning("No candidates found. (Seeding might have failed.)")
@@ -200,11 +191,11 @@ if submitted:
     st.write(f"**Apartment:** {match['apartment'].get('neighborhood','(n/a)')} · €{match['apartment'].get('rent','?')}")
     st.caption(f"Similarity ≈ {match['similarity']:.3f}")
 
-    with st.expander("Debug: recent users (PII store) + profile text sent to Chroma"):
+    with st.expander("Debug: recent users (from Supabase) + profile text sent to Chroma"):
         st.json({
             "recent_users": fetch_recent_users(5),
             "user_uuid": user_uuid,
             "profile_text_embedded": profile_text
         })
 
-st.caption("PII (name, user_id) lives in SQLite (or Supabase later). Answers live in Chroma as embedded text.")
+st.caption("Architecture: Supabase stores identity (name,user_id,user_uuid). Chroma stores embedded text of answers for matching.")
