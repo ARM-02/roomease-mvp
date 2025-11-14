@@ -208,3 +208,12 @@ if submitted:
         })
 
 st.caption("PII (name, user_id) lives in SQLite (or Supabase later). Answers live in Chroma as embedded text.")
+
+
+if st.sidebar.button("⚠️ Delete local DB (dev)"):
+    try:
+        os.remove("app.db")
+        st.sidebar.success("Deleted app.db. Please rerun the app.")
+    except FileNotFoundError:
+        st.sidebar.info("No app.db found.")
+
