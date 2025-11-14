@@ -1,4 +1,5 @@
 streamlit>=1.39
+supabase
 chromadb>=0.5
 sentence-transformers>=3.0
 numpy>=1.26
