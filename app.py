@@ -115,8 +115,9 @@ def seed_demo_if_empty(roommates, apartments):
         apartments.upsert(ids=ids, documents=docs, metadatas=metas, embeddings=vecs)
 
 def query_matches(roommates, apartments, user_vec):
-    r = roommates.query(query_embeddings=[user_vec], n_results=3, include=["metadatas","distances","ids"])  # type: ignore
-    a = apartments.query(query_embeddings=[user_vec], n_results=3, include=["metadatas","distances","ids"])  # type: ignore
+    r = roommates.query(query_embeddings=[user_vec], n_results=3, include=["metadatas","distances"])
+    a = apartments.query(query_embeddings=[user_vec], n_results=3, include=["metadatas","distances"])
+
     roommate_hits = [
         {"id": rid, **meta, "distance": dist}
         for rid, meta, dist in zip(r["ids"][0], r["metadatas"][0], r["distances"][0])
