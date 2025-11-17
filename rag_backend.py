@@ -1,19 +1,19 @@
 from __future__ import annotations
-import os
 from typing import List, Dict, Any
+import os, requests, json
 
 import chromadb
 from sentence_transformers import SentenceTransformer
-from groq import Groq   # <<--- NEW
 
-
-# --- Config: MUST match your embeddings script ---
+# --- Config: MUST match your index scripts ---
 DB_PATH = "./chroma_store"
 APTS_COLLECTION = "apartments"
 STUDENTS_COLLECTION = "students"
 EMBED_MODEL = "all-MiniLM-L6-v2"
 
-# --- 1. Load embedder (same model as embeddings.py) ---
+LMSTUDIO_URL = "http://localhost:1234/v1/chat/completions"  # LM Studio HTTP server
+
+# --- 1. Load embedder (same model as embeddings) ---
 embedder = SentenceTransformer(EMBED_MODEL)
 
 def embed_query(text: str) -> List[List[float]]:
@@ -24,23 +24,24 @@ client = chromadb.PersistentClient(path=DB_PATH)
 apts = client.get_collection(APTS_COLLECTION)
 students = client.get_collection(STUDENTS_COLLECTION)
 
-# --- 3. Groq client (your API key directly here) ---
-GROQ_API_KEY = "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"
-
-groq_client = Groq(api_key=GROQ_API_KEY)
-
+# --- 3. LM Studio client ---
 def run_llm(prompt: str) -> str:
-    """Send prompt to Groq Llama 3 model."""
-    completion = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=250,
-        temperature=0.2,
+    """Send prompt to local LM Studio model."""
+    resp = requests.post(
+        LMSTUDIO_URL,
+        json={
+            "model": "lmstudio",  # must match the model name in LM Studio UI
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 900,
+        },
+        timeout=120,
     )
-    return completion.choices[0].message.content
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
 
-# 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
-
+# --- Format helpers ---
 def _format_apartment_context(res: Dict[str, Any]) -> str:
     """Pretty-print top apartment hits for the prompt."""
     docs = res["documents"][0]
@@ -68,7 +69,7 @@ def _format_apartment_context(res: Dict[str, Any]) -> str:
             header_parts.append(title)
         if hood:
             header_parts.append(f"Neighborhood: {hood}")
-        if price not in ("", None):
+        if price not in ("", None, ""):
             header_parts.append(f"Price: €{price}")
 
         header = " | ".join(header_parts) if header_parts else "Apartment"
@@ -82,36 +83,40 @@ def _format_student_context(res):
 
     lines = []
     for doc, meta in zip(docs, metas):
-        name = meta.get("name", "Unnamed")
-        personality = meta.get("personality", "")
-        lifestyle = meta.get("lifestyle_summary", "")
-        sleep = meta.get("sleep_schedule", "")
-        noise = meta.get("noise_tolerance", "")
+        name = meta.get("name") or "Unnamed candidate"
+        personality = meta.get("personality", "not specified")
+        lifestyle = meta.get("lifestyle_summary", "not specified")
+        sleep = meta.get("sleep_schedule", "not specified")
+        noise = meta.get("noise_tolerance", "not specified")
+        dog = meta.get("dog_friendliness", "not specified")
+        clean = meta.get("cleanliness", "not specified")
+        study = meta.get("study_habits", "not specified")
+        chunk_idx = meta.get("chunk_index", "?")
 
         lines.append(
-            f"- {name}\n"
+            f"- Candidate (chunk {chunk_idx}) — {name}\n"
             f"  Personality: {personality}\n"
             f"  Lifestyle: {lifestyle}\n"
             f"  Sleep schedule: {sleep}\n"
             f"  Noise tolerance: {noise}\n"
+            f"  Dog friendliness: {dog}\n"
+            f"  Cleanliness: {clean}\n"
+            f"  Study habits: {study}\n"
             f"  Raw text: {doc[:200]}..."
         )
 
     return "\n\n".join(lines)
 
-
-# --- 4. Main recommend() function using both collections ---
+# --- 4. Main recommend() function ---
 def recommend(query: str, n_apts: int = 3, n_students: int = 6) -> str:
     """
-    Upgraded roommate-matching engine:
+    Roommate-matching engine:
     - Ranks multiple candidate roommates
-    - Creates structured summaries
-    - Computes a compatibility matrix (0–100)
-    - Identifies conflict risks with severity score
-    - Recommends final apartment + roommate pair
+    - Computes compatibility matrix
+    - Chooses best apartment + roommate pair
     """
 
-    # --- Retrieve data ---
+    # --- Retrieve data from Chroma ---
     q_emb = embed_query(query)
 
     apt_res = apts.query(
@@ -125,27 +130,9 @@ def recommend(query: str, n_apts: int = 3, n_students: int = 6) -> str:
     )
 
     apt_context = _format_apartment_context(apt_res)
+    stu_context = _format_student_context(stu_res)
 
-    # Format roommate context
-    roommate_context = []
-    for doc, meta in zip(stu_res["documents"][0], stu_res["metadatas"][0]):
-        roommate_context.append(
-            {
-                "chunk": meta.get("chunk_index"),
-                "text": doc,
-                "source": meta.get("source"),
-            }
-        )
-
-    # Convert to readable block
-    roommate_block = "\n\n".join(
-        [
-            f"[Candidate {i+1}] (chunk {c['chunk']})\n{c['text']}"
-            for i, c in enumerate(roommate_context)
-        ]
-    )
-
-    # --- FULL LLM PROMPT ---
+    # --- LLM prompt ---
     prompt = f"""
 You are an expert roommate-matching AI trained in lifestyle analysis, habit modeling,
 interpersonal compatibility, and flat-sharing dynamics in university living.
@@ -153,27 +140,23 @@ interpersonal compatibility, and flat-sharing dynamics in university living.
 USER PREFERENCES:
 \"\"\"{query}\"\"\"
 
-
 APARTMENTS AVAILABLE (TOP {n_apts} FROM RAG):
 {apt_context}
 
-
-POTENTIAL ROOMMATE CANDIDATES (TOP {n_students} FROM PDF):
-{roommate_block}
-
+POTENTIAL ROOMMATE CANDIDATES (TOP {n_students} FROM RAG):
+{stu_context}
 
 ========================
 TASK (STRICT RULES):
 ========================
 
-### 1. Identify **ALL** candidates
+### 1. Identify ALL candidates
 For each candidate:
-- Extract ANY name mentioned (if present).
-- If no name: assign a label like “Candidate A – quiet outgoing student”.
-- Provide **4–6 bullet points** describing their lifestyle, habits, and personality.
-- Summaries must ONLY use information from the chunk. If unsure → say “not specified”.
+- Use the name from the metadata if present; otherwise keep the label as given.
+- Provide 4–6 bullet points describing their lifestyle, habits, and personality.
+- Summaries must ONLY use information from the context above. If unsure → say “not specified”.
 
-### 2. Generate a **compatibility matrix (0–100)** for each candidate
+### 2. Generate a compatibility matrix (0–100) for each candidate
 Dimensions (each scored separately):
 1. Cleanliness & tidiness  
 2. Noise tolerance / quietness  
@@ -186,10 +169,10 @@ Dimensions (each scored separately):
 9. Daily routine alignment  
 10. Conflict-avoidance ability  
 
-Output must be a table-like block per candidate.
+Output a small table-like block per candidate.
 
 ### 3. Compute an OVERALL SCORE (0–100)
-Use a weighted average:
+Weighted average:
 - cleanliness 15%
 - noise 15%
 - sleep schedule 15%
@@ -200,23 +183,22 @@ Use a weighted average:
 - routine alignment 5%
 - conflict-avoidance 5%
 
-### 4. Identify **conflict risks** for each roommate
+### 4. Identify conflict risks for each roommate
 - 2–4 risks MAX
 - Each marked as: minor / moderate / serious
 
-### 5. Produce a **ranked list** of roommates (best → worst)
+### 5. Produce a ranked list of roommates (best → worst)
 Include 1–2 sentences explaining the ranking.
 
 ### 6. Choose ONE best apartment from the RAG results
-Justify the apartment using:
+Justify using:
 - neighborhood
 - price
 - quiet vs social environment
-- amenities (private bathroom, pets allowed)
-- sunrise/sunset exposure if relevant
-- any detail explicitly present in the RAG context
+- key amenities (bathroom, pets, etc.)
+- only details that actually appear above
 
-### 7. Final output format (MANDATORY):
+### 7. Final output format:
 
 #### 🧑‍🤝‍🧑 Best Roommate Match
 (name or label)
@@ -224,7 +206,7 @@ Justify the apartment using:
 #### 🔢 Compatibility Score: XX/100
 
 #### 📊 Compatibility Matrix
-(list the 10 scores)
+(list the 10 scores clearly)
 
 #### ⚠️ Conflict Risks
 - Risk (severity)
@@ -237,15 +219,18 @@ Justify the apartment using:
 Give a clear recommendation.
 
 STRICT RULE:
-You MUST NOT hallucinate details not present in the RAG context.
+You MUST NOT invent new facts not present in the apartment or student context.
 If a detail is unknown, say “not specified”.
-
-Begin with the multi-candidate analysis now.
 """
 
     return run_llm(prompt)
 
-# --- 5. Quick manual test ---
+# --- Manual test ---
 if __name__ == "__main__":
-    q = "I want a quiet big dog friendly apartment in barrio salamanca with a budget of 3300 euros a month a max, i want my own private bathroom and sunset views"
+    q = (
+        "I want a quiet big dog friendly apartment in barrio Salamanca with a budget of "
+        "3300 euros a month max. I want my own private bathroom and sunset views. "
+        "I am very extroverted, not very organised and spontaneous, and I cannot handle "
+        "people that are too structured."
+    )
     print(recommend(q))
