@@ -1,33 +1,13 @@
 import streamlit as st
+import requests
 import uuid, os
 from datetime import datetime
-from dataclasses import dataclass
-from typing import Dict, List
 
-# ====================== 🎯 Config & Theming ======================
-st.set_page_config(
-    page_title="RoomEase+ Pro",
-    page_icon="🏡",
-    layout="wide",
-    menu_items={
-        "About": "RoomEase+ Pro — demo app that stores PII in Supabase and embeds preference signals into Chroma for matching."
-    },
-)
+# ====================== App Config ======================
+st.set_page_config(page_title="RoomEase+ — Chat Questionnaire", page_icon="🏡", layout="centered")
 
-# --- Minimal dark-ish polish without requiring a custom theme ---
-st.markdown(
-    """
-    <style>
-      .re-card {border:1px solid rgba(120,120,120,.2); border-radius: 16px; padding: 18px; background: rgba(255,255,255,.65); backdrop-filter: blur(8px);} 
-      .re-pill {display:inline-block; padding:4px 10px; border-radius:999px; background:#eef1ff; font-size:12px; margin-right:6px}
-      .re-hero {border-radius: 20px; padding: 24px; background: linear-gradient(135deg, #f1f5ff 0%, #eefcf5 100%);} 
-      .stSlider > div[data-baseweb="slider"]{ margin-top: -10px;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ====================== 🔐 Supabase (PII store) ======================
+# ====================== Supabase (PII store) ======================
+# Kept exactly as before so you can still persist identity.
 from supabase import create_client
 
 def get_supabase():
@@ -41,295 +21,158 @@ def get_supabase():
 
 supabase = get_supabase()
 
-
 def save_user(name: str, user_id: str) -> str:
     """Create a user record in Supabase and return a fresh user_uuid."""
     user_uuid = str(uuid.uuid4())
     created = datetime.utcnow().isoformat()
     # Table schema expected in Supabase:
     # users(user_uuid uuid unique, user_id text unique, name text, created_at timestamp default now())
-    res = supabase.table("users").insert({
+    supabase.table("users").insert({
         "user_uuid": user_uuid,
         "user_id": user_id,
         "name": name,
-        "created_at": created
+        "created_at": created,
     }).execute()
-    # (Optional) inspect res.data / res.error here
     return user_uuid
 
-
-def fetch_recent_users(limit: int = 5):
-    res = supabase.table("users").select("user_uuid,name,user_id,created_at").order("created_at", desc=True).limit(limit).execute()
-    return res.data or []
-
-# ====================== 📊 Chroma (embeddings + matching) ======================
-from sentence_transformers import SentenceTransformer
-import chromadb
-
-@st.cache_resource(show_spinner=False)
-def load_embed_model():
-    return SentenceTransformer("all-MiniLM-L6-v2")
-
-@st.cache_resource(show_spinner=False)
-def get_chroma_client():
-    return chromadb.PersistentClient(path=".chroma")
-
-
-def get_collections(client):
-    roommates = client.get_or_create_collection("roommate_profiles", metadata={"hnsw:space":"cosine"})
-    apartments = client.get_or_create_collection("apartment_listings", metadata={"hnsw:space":"cosine"})
-    user_profiles = client.get_or_create_collection("user_profiles", metadata={"hnsw:space":"cosine"})
-    return roommates, apartments, user_profiles
-
-
-# ====================== 🧠 Questions (Big Five flavored) ======================
-@dataclass
-class Q:
-    id: str
-    text: str
-    trait: str
-
-QUESTIONS: List[Q] = [
-    Q("q1",  "Do you like trying new experiences, foods, or activities — or do you prefer routines you already enjoy?", "Openness"),
-    Q("q2",  "How do you feel about spontaneous plans or surprises?",                                     "Openness"),
-    Q("q3",  "Do you like to keep your space organized and plan your day ahead, or do you go with the flow?", "Conscientiousness"),
-    Q("q4",  "How punctual are you for classes or appointments?",                                          "Conscientiousness"),
-    Q("q5",  "When you come home after a long day, do you enjoy chatting with roommates or prefer quiet time alone?", "Extraversion"),
-    Q("q6",  "Would you enjoy hosting small gatherings or prefer a calm apartment?",                       "Extraversion"),
-    Q("q7",  "When conflicts arise, do you usually try to find compromise or prefer to stand your ground?", "Agreeableness"),
-    Q("q8",  "Would you describe yourself as easygoing and patient?",                                      "Agreeableness"),
-    Q("q9",  "When things go wrong (like a noisy neighbor or exam stress), do you get anxious easily or stay calm?", "Neuroticism"),
-    Q("q10", "How often do you need alone time to recharge?",                                               "Neuroticism / Extraversion"),
+# ====================== Questions ======================
+QUESTIONS = [
+    ("q1",  "Do you prefer quiet nights or social evenings?"),
+    ("q2",  "How important is cleanliness to you?"),
+    ("q3",  "Are you an early riser or a night owl?"),
+    ("q4",  "Do you like hosting guests regularly?"),
+    ("q5",  "How do you feel about sharing household items (e.g., cookware)?"),
+    ("q6",  "Do you follow routines or prefer spontaneity?"),
+    ("q7",  "How punctual are you for classes/appointments?"),
+    ("q8",  "How do you handle conflicts with roommates?"),
+    ("q9",  "How sensitive are you to noise when studying or sleeping?"),
+    ("q10", "Do you prefer to plan your day ahead or go with the flow?"),
+    ("q11", "How often do you need alone time to recharge?"),
+    ("q12", "Do you prefer tidy minimal spaces or a lived‑in vibe?"),
 ]
 
-TRAIT_ORDER = ["Openness", "Conscientiousness", "Extraversion", "Agreeableness", "Neuroticism"]
+CHOICES = [
+    "Strongly prefer first option",
+    "Prefer first option",
+    "Neutral / depends",
+    "Prefer second option",
+    "Strongly prefer second option",
+]
 
+# ====================== Styles ======================
+st.markdown(
+    """
+    <style>
+      .bubble {border-radius: 16px; padding: 10px 14px; margin: 6px 0; max-width: 650px}
+      .left  {background:#f1f5f9;}
+      .right {background:#e7f3ff; margin-left:auto}
+      .brand {font-weight:600}
+      .card  {border:1px solid rgba(120,120,120,.2); border-radius:16px; padding:16px}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-def trait_buckets(scores: Dict[str, List[int]]):
-    """Average 1-5 scores per trait and return a compact descriptor string used for embeddings."""
-    avgs = {}
-    for t, vals in scores.items():
-        if not vals:
-            continue
-        avgs[t] = sum(vals) / len(vals)
-    # Round to one decimal for readability
-    parts = [f"{t}:{avgs.get(t,0):.1f}" for t in TRAIT_ORDER]
-    return "; ".join(parts), avgs
-
-
-# ====================== 🔎 Embedding helpers ======================
-
-def embed_text(text: str) -> List[float]:
-    model = load_embed_model()
-    vec = model.encode([text], normalize_embeddings=True)[0]
-    return vec.tolist()
-
-
-def seed_demo_if_empty(roommates, apartments):
-    # Defensive counts for both older & newer Chroma client versions
-    try:
-        r_count = roommates.count(); a_count = apartments.count()
-    except Exception:
-        r_count = len(roommates.peek().get("ids", []) or [])
-        a_count = len(apartments.peek().get("ids", []) or [])
-
-    if r_count == 0:
-        demo_roommates = [
-            {"name":"Andrea","quiet":True,"study":True,"guests":"low"},
-            {"name":"Leo","quiet":False,"study":False,"guests":"high"},
-            {"name":"Sara","quiet":True,"study":True,"guests":"low"},
-        ]
-        ids, docs, metas, vecs = [], [], [], []
-        for i, rm in enumerate(demo_roommates):
-            text = f"name={rm['name']} quiet={rm['quiet']} study={rm['study']} guests={rm['guests']}"
-            ids.append(f"rm_{i}")
-            docs.append(text)
-            metas.append(rm)
-            vecs.append(embed_text(text))
-        roommates.upsert(ids=ids, documents=docs, metadatas=metas, embeddings=vecs)
-
-    if a_count == 0:
-        demo_apartments = [
-            {"neighborhood":"Salamanca","rent":900,"quiet":True},
-            {"neighborhood":"Chamberí","rent":800,"quiet":True},
-            {"neighborhood":"Malasaña","rent":950,"quiet":False},
-        ]
-        ids, docs, metas, vecs = [], [], [], []
-        for i, ap in enumerate(demo_apartments):
-            text = f"neighborhood={ap['neighborhood']} rent={ap['rent']} quiet={ap['quiet']}"
-            ids.append(f"ap_{i}")
-            docs.append(text)
-            metas.append(ap)
-            vecs.append(embed_text(text))
-        apartments.upsert(ids=ids, documents=docs, metadatas=metas, embeddings=vecs)
-
-
-def query_matches(roommates, apartments, user_vec):
-    r = roommates.query(query_embeddings=[user_vec], n_results=3, include=["metadatas","distances"])
-    a = apartments.query(query_embeddings=[user_vec], n_results=3, include=["metadatas","distances"])
-
-    roommate_hits = [
-        {"id": rid, **meta, "distance": dist}
-        for rid, meta, dist in zip(r["ids"][0], r["metadatas"][0], r["distances"][0])
-    ]
-    apt_hits = [
-        {"id": aid, **meta, "distance": dist}
-        for aid, meta, dist in zip(a["ids"][0], a["metadatas"][0], a["distances"][0])
-    ]
-    if not roommate_hits or not apt_hits:
-        return None
-    best_rm = min(roommate_hits, key=lambda x: x["distance"]) 
-    best_ap = min(apt_hits, key=lambda x: x["distance"]) 
-    similarity = 1.0 - (best_rm["distance"] + best_ap["distance"]) / 2.0
-    return {"roommate": best_rm, "apartment": best_ap, "similarity": similarity}
-
-
-# ====================== 🧩 App Pages ======================
-PAGES = ["Welcome", "Questionnaire", "Results", "Admin"]
-page = st.sidebar.radio("Navigation", PAGES, index=0)
-
-st.sidebar.markdown("---")
-st.sidebar.caption("PII → Supabase • Answers → Chroma embeddings • Local demo data for matches")
-
-# --- Shared state across pages ---
-if "last_match" not in st.session_state:
-    st.session_state.last_match = None
+# ====================== State ======================
+if "mode" not in st.session_state:
+    st.session_state.mode = "greeting"  # greeting → info → ask → send → done
+if "idx" not in st.session_state:
+    st.session_state.idx = 0
+if "answers" not in st.session_state:
+    st.session_state.answers = {}
 if "user_uuid" not in st.session_state:
     st.session_state.user_uuid = None
-if "trait_avgs" not in st.session_state:
-    st.session_state.trait_avgs = {}
+if "endpoint" not in st.session_state:
+    # You can also set RECOMMEND_API_URL in your env; we fall back to this state value.
+    st.session_state.endpoint = os.getenv("RECOMMEND_API_URL", "")
 
+# Sidebar controls
+with st.sidebar:
+    st.caption("Frontend collects answers only. Backend will score/match later.")
+    st.session_state.endpoint = st.text_input("Backend base URL (optional)", st.session_state.endpoint, help="Example: https://api.example.com")
+    if st.button("Reset Flow"):
+        st.session_state.mode = "greeting"; st.session_state.idx = 0
+        st.session_state.answers = {}; st.session_state.user_uuid = None
+        st.experimental_rerun()
 
-# ====================== 🚪 Welcome ======================
-if page == "Welcome":
+st.title("🏡 RoomEase+ — Chat Questionnaire")
+
+# ====================== Greeting ======================
+if st.session_state.mode == "greeting":
     st.markdown("""
-    <div class='re-hero'>
-      <h1>🏡 RoomEase+ Pro</h1>
-      <p>Find a compatible roommate & a quiet, study‑friendly apartment. Identity is stored safely in Supabase, while your questionnaire signals are embedded (no PII) into Chroma for matching.</p>
-      <div class='re-pill'>Supabase</div>
-      <div class='re-pill'>Chroma</div>
-      <div class='re-pill'>SentenceTransformers</div>
-      <div class='re-pill'>Streamlit</div>
-    </div>
+    <div class='bubble left'><span class='brand'>RoomEase+</span>: Hello! How are you? Ready to answer a few personality questions?</div>
     """, unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    if c1.button("Yes, let's go", type="primary"):
+        st.session_state.mode = "info"
+        st.experimental_rerun()
+    if c2.button("Not now"):
+        st.stop()
 
-    c1, c2, c3 = st.columns([1.2,1,1])
-    with c1:
-        st.markdown("### How it works")
-        st.write("1) Add your name & ID (PII) → stored in Supabase.")
-        st.write("2) Answer 10 quick questions (1–5 scale).")
-        st.write("3) We embed the resulting trait profile → Chroma → retrieve best roommate & apartment from demo pool.")
-    with c2:
-        st.metric("Questions", 10)
-        st.metric("Traits Covered", 5)
-    with c3:
-        st.metric("Demo Roommates", 3)
-        st.metric("Demo Apartments", 3)
-
-# ====================== 📝 Questionnaire ======================
-if page == "Questionnaire":
-    st.header("Your info")
-    with st.container():
+# ====================== Collect Name/ID ======================
+if st.session_state.mode == "info":
+    st.markdown("<div class='bubble left'>Great! First, what's your name and student ID?</div>", unsafe_allow_html=True)
+    with st.form("pii_form", clear_on_submit=False):
         c1, c2 = st.columns(2)
         name = c1.text_input("Name")
         user_id = c2.text_input("User ID")
-
-    st.markdown("---")
-    st.subheader("Personality & living preferences")
-    st.caption("Use the sliders: 1 = strongly prefer the first option, 5 = strongly prefer the second option. 3 = neutral.")
-
-    scores: Dict[str, List[int]] = {t: [] for t in TRAIT_ORDER}
-    answers: Dict[str, int] = {}
-
-    for q in QUESTIONS:
-        with st.expander(q.text, expanded=False):
-            val = st.slider(q.id, min_value=1, max_value=5, value=3, step=1)
-            answers[q.id] = val
-            # Split hybrid trait label into primary key bucket
-            primary_trait = q.trait.split("/")[0].strip()
-            if primary_trait not in scores:
-                scores[primary_trait] = []
-            scores[primary_trait].append(val)
-
-    extra_notes = st.text_area("Anything else you'd want us to consider? (optional)", height=80)
-
-    submitted = st.button("Save, Embed & Get My Match", type="primary")
-
-    if submitted:
+        start = st.form_submit_button("Start questions →", type="primary")
+    if start:
         if not name or not user_id:
-            st.error("Please fill name and user ID.")
-            st.stop()
+            st.warning("Please fill both name and user ID.")
+        else:
+            st.session_state.user_uuid = save_user(name, user_id)
+            st.session_state.mode = "ask"
+            st.experimental_rerun()
 
-        # 1) Save only PII in Supabase
-        user_uuid = save_user(name, user_id)
-        st.session_state.user_uuid = user_uuid
+# ====================== Ask Questions (one by one) ======================
+if st.session_state.mode == "ask":
+    idx = st.session_state.idx
+    qid, qtext = QUESTIONS[idx]
 
-        # 2) Build a compact profile text for embedding
-        trait_str, avgs = trait_buckets(scores)
-        st.session_state.trait_avgs = avgs
-        profile_text = f"traits=[{trait_str}] | notes={extra_notes.strip()}"
-        user_vec = embed_text(profile_text)
+    st.progress((idx) / len(QUESTIONS))
+    st.markdown(f"<div class='bubble left'><strong>Q{idx+1}.</strong> {qtext}</div>", unsafe_allow_html=True)
 
-        # 3) Chroma: upsert + seed demo if empty
-        client = get_chroma_client()
-        roommates, apartments, user_profiles = get_collections(client)
-        seed_demo_if_empty(roommates, apartments)
+    # Use radio for discrete choices; raw text also works if you prefer
+    choice = st.radio("Your answer", CHOICES, index=2, key=f"ans_{qid}")
 
-        user_profiles.upsert(
-            ids=[user_uuid],
-            documents=[profile_text],
-            embeddings=[user_vec],
-            metadatas=[{"name": name, "user_id": user_id}],  # you can drop PII here if you prefer
-        )
+    cols = st.columns(2)
+    if cols[0].button("Next", type="primary"):
+        st.session_state.answers[qid] = {"question": qtext, "answer": choice}
+        if idx + 1 < len(QUESTIONS):
+            st.session_state.idx += 1
+            st.experimental_rerun()
+        else:
+            st.session_state.mode = "send"
+            st.experimental_rerun()
+    if cols[1].button("Back", disabled=(idx == 0)):
+        st.session_state.idx = max(0, idx - 1)
+        st.experimental_rerun()
 
-        # 4) Query match
-        match = query_matches(roommates, apartments, user_vec)
-        if not match:
-            st.warning("No candidates found. (Seeding might have failed.)")
-            st.stop()
+# ====================== Send to Backend ======================
+if st.session_state.mode == "send":
+    payload = {
+        "user_uuid": st.session_state.user_uuid,
+        "answers": st.session_state.answers,
+    }
 
-        st.session_state.last_match = match
-        st.success("Saved (PII), embedded (answers), and matched! Switch to the Results tab →")
+    st.markdown("<div class='bubble left'>Awesome — wrapping things up…</div>", unsafe_allow_html=True)
 
-# ====================== ✅ Results ======================
-if page == "Results":
-    match = st.session_state.get("last_match")
-    if not match:
-        st.info("Run the questionnaire first to see your match.")
-    else:
-        st.markdown("### Your Match")
-        c1, c2, c3 = st.columns([1.2,1,1])
-        with c1:
-            st.markdown("<div class='re-card'>", unsafe_allow_html=True)
-            st.subheader("👤 Roommate")
-            st.write(f"**Name:** {match['roommate'].get('name','(unknown)')}")
-            st.write(f"**Quiet:** {match['roommate'].get('quiet')}")
-            st.write(f"**Guests:** {match['roommate'].get('guests')}")
-            st.markdown("</div>", unsafe_allow_html=True)
-        with c2:
-            st.markdown("<div class='re-card'>", unsafe_allow_html=True)
-            st.subheader("🏘️ Apartment")
-            st.write(f"**Neighborhood:** {match['apartment'].get('neighborhood','(n/a)')}")
-            st.write(f"**Rent:** €{match['apartment'].get('rent','?')}")
-            st.write(f"**Quiet:** {match['apartment'].get('quiet')}")
-            st.markdown("</div>", unsafe_allow_html=True)
-        with c3:
-            st.markdown("<div class='re-card'>", unsafe_allow_html=True)
-            st.subheader("📈 Similarity")
-            st.metric("Score (0–1)", f"{match['similarity']:.3f}")
-            if st.session_state.trait_avgs:
-                for t in TRAIT_ORDER:
-                    if t in st.session_state.trait_avgs:
-                        st.progress(min(max((st.session_state.trait_avgs[t]-1)/4,0),1), text=t)
-            st.markdown("</div>", unsafe_allow_html=True)
+    endpoint = st.session_state.endpoint.strip().rstrip("/")
+    url = f"{endpoint}/recommend" if endpoint else None
 
-        st.caption("Similarity is computed as 1 - average cosine distance to the top roommate and apartment candidates.")
+    with st.spinner("Sending answers to backend…"):
+        try:
+            if url:
+                # Safe best-effort POST; ignore the result per spec.
+                _ = requests.post(url, json=payload, timeout=30)
+        except Exception as e:
+            st.info("Couldn't reach the backend yet (that's OK for now).")
 
-# ====================== 🛠️ Admin ======================
-if page == "Admin":
-    st.subheader("Recent users (from Supabase)")
-    data = fetch_recent_users(10)
-    st.json(data)
+    st.success("Your match is being analyzed…")
+    st.caption("The backend will interpret, embed, match, and return the final recommendation when ready.")
 
-    st.subheader("Debug notes")
-    st.write("- Only PII (name, user_id, user_uuid) goes to Supabase.\n- Trait string + optional notes are embedded to Chroma.")
+    if st.button("Start over"):
+        st.session_state.mode = "greeting"; st.session_state.idx = 0
+        st.session_state.answers = {}; st.session_state.user_uuid = None
+        st.experimental_rerun()
