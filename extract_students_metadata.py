@@ -11,11 +11,20 @@ DB_PATH = "./chroma_store"
 STUDENTS_COLLECTION = "students"
 EMBED_MODEL = "all-MiniLM-L6-v2"
 
-LMSTUDIO_URL = "http://localhost:1234/v1/chat/completions"  # LM Studio HTTP server
+LMSTUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions" # LM Studio HTTP server
 
 # ======================= Utils =========================
 def normalize_space(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
+
+def sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, str]:
+    clean = {}
+    for k, v in meta.items():
+        if v is None:
+            clean[k] = "not specified"
+        else:
+            clean[k] = str(v)
+    return clean
 
 def split_students(raw_text: str) -> List[str]:
     """
@@ -23,7 +32,7 @@ def split_students(raw_text: str) -> List[str]:
     Adjust the regex if your PDF has a different structure.
     """
     # Example: names like "Briana Thomas", "Lisa Williamson" on their own line
-    parts = re.split(r"\n\s*[A-Z][a-z]+\s+[A-Z][a-z]+\s*\n", raw_text)
+    parts = re.split(r"(?=STUDENT \d+)", raw_text)
     if len(parts) <= 2:
         # Fallback: big chunks if the regex fails
         approx_size = 1200
@@ -38,7 +47,7 @@ def ask_local_llm(prompt: str) -> Dict:
     resp = requests.post(
         LMSTUDIO_URL,
         json={
-            "model": "lmstudio",   # in LM Studio: set this to your loaded model name
+            "model": "llama-3.2-1b-instruct",   # in LM Studio: set this to your loaded model name
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
             "max_tokens": 400,
@@ -48,7 +57,15 @@ def ask_local_llm(prompt: str) -> Dict:
     resp.raise_for_status()
     data = resp.json()
     content = data["choices"][0]["message"]["content"]
-    return json.loads(content)
+
+    # Find the first JSON block in the (possibly messy) LLM response
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+
+    if not match:
+        raise ValueError("No JSON object found in LLM response")
+
+    json_string = match.group(0)
+    return json.loads(json_string)
 
 EXTRACTION_PROMPT = """
 You will read one student's personality / housing preference response
@@ -99,7 +116,7 @@ def embed_texts(model, texts: List[str]):
 # =========================== Main ======================
 def main():
     ap = argparse.ArgumentParser(description="Index students from PDF into Chroma with metadata using LM Studio.")
-    ap.add_argument("--pdf", required=True, help="Path to student responses PDF")
+    ap.add_argument("--pdf", required=True, help="data/fake_student_ocean_responses_long")
     ap.add_argument("--db", default=DB_PATH)
     ap.add_argument("--model", default=EMBED_MODEL)
     ap.add_argument("--reset", action="store_true", help="Delete students collection before indexing")
@@ -142,6 +159,9 @@ def main():
         # enrich meta with technical fields
         meta["source"] = os.path.abspath(args.pdf)
         meta["chunk_index"] = i
+
+        # sanitize before saving
+        meta = sanitize_metadata(meta)
 
         emb = embed_texts(embedder, [block])[0]
 
