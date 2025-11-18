@@ -4,6 +4,15 @@ RoomEase is an AI-powered roommate and apartment recommendation app built with *
 
 ---
 
+
+### 🧩 Quick Summary
+
+1. Download LLM Studio → Load LLaMA 3B Instruct → Start server on port 1234
+2. Set Gemini api key for Gemini flash 2 in the environment though the terminal console
+3. `streamlit run app.py`
+
+---
+
 ## ✨ Features
 
 * 💬 **Conversational interface** – Streamlit chatbot guides the user through 10 personality questions.
@@ -124,11 +133,4 @@ roomease-mvp/
 * **ChromaDB** → Stores embeddings for apartments and students.
 * **SentenceTransformer + CrossEncoder** → Handles retrieval and reranking.
 
----
 
-### 🧩 Quick TL;DR
-
-1. Download LLM Studio → Load LLaMA 3B Instruct → Start server on port 1234
-2. `export GEMINI_API_KEY=...`
-3. `streamlit run app.py`
-   ✅ That’s it — RoomEase is live!
