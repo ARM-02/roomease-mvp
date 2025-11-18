@@ -1,279 +1,754 @@
 from __future__ import annotations
-from typing import List, Dict, Any
-import os, requests, json, re
+from typing import List, Dict, Any, Optional
+import os
+import json
+import re
+
 
 import chromadb
 from sentence_transformers import SentenceTransformer
+import google.generativeai as genai
+from backend.apartment_description_summarizer import summarize_description
 
-# --- Config: MUST match your index scripts ---
-DB_PATH = "./chroma_store"
-APTS_COLLECTION = "apartments"
-STUDENTS_COLLECTION = "students"
-EMBED_MODEL = "all-MiniLM-L6-v2"
 
-# LM Studio HTTP server
-LMSTUDIO_URL = "http://127.0.0.1:1234/v1/chat/completions"
 
-# --- 1. Load embedder (same model as embeddings) ---
+
+
+#Helper json function
+
+def clean_json(text: str) -> str:
+    # Remove newlines
+    t = text.strip().replace("\n", " ")
+
+    # Remove trailing commas before } or ]
+    t = re.sub(r",\s*}", "}", t)
+    t = re.sub(r",\s*]", "]", t)
+    t = t.replace("```json", "").replace("```", "")
+
+    # Remove leading garbage before a JSON object
+    first_brace = t.find("{")
+    if first_brace > 0:
+        t = t[first_brace:]
+
+    return t
+
+
+# ======================================================
+# 0. GEMINI CONFIG
+# ======================================================
+
+GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025"
+
+api_key = os.environ.get("GEMINI_API_KEY")
+if not api_key:
+    print("=" * 60)
+    print("ERROR: GEMINI_API_KEY environment variable not set.")
+    print("Export it first, e.g.:")
+    print('  export GEMINI_API_KEY="your_api_key_here"')
+    print("=" * 60)
+    raise SystemExit(1)
+
+genai.configure(api_key=api_key)
+
+
+def run_gemini(prompt: str, json_schema: Optional[Dict] = None) -> str:
+    """
+    Safe wrapper around Gemini generate_content.
+    If json_schema is provided → ask for JSON and return response.text.
+    Otherwise → return plain text.
+    """
+    try:
+        gen_config: Dict[str, Any] = {
+            "temperature": 0.2,
+            "max_output_tokens": 4096,
+        }
+
+        if json_schema is not None:
+            gen_config["response_mime_type"] = "application/json"
+            gen_config["response_schema"] = json_schema
+
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        response = model.generate_content(
+            prompt,
+            generation_config=gen_config,
+        )
+
+        if not response.candidates:
+            return "ERROR: Gemini returned no candidates."
+
+        if json_schema is not None:
+            if getattr(response, "text", None):
+                return response.text
+            # Fallback: concat text parts
+            cand = response.candidates[0]
+            txt = ""
+            for p in cand.content.parts:
+                if hasattr(p, "text"):
+                    txt += p.text
+            return txt or "ERROR: Empty JSON response."
+
+        # Free-text mode
+        cand = response.candidates[0]
+        out = ""
+        for p in cand.content.parts:
+            if hasattr(p, "text"):
+                out += p.text
+        return out.strip() or "(empty response)"
+
+    except Exception as e:
+        return f"ERROR: Gemini API failed: {e}"
+
+
+# ======================================================
+# 1. EMBEDDINGS & CHROMA
+# ======================================================
+
 print("[INFO] Loading embedding model...")
+EMBED_MODEL = "all-MiniLM-L6-v2"
 embedder = SentenceTransformer(EMBED_MODEL)
 
 
 def embed_query(text: str) -> List[List[float]]:
-    """Encodes a single query string."""
     return embedder.encode([text], normalize_embeddings=True).tolist()
 
 
-# --- 2. Load Chroma persistent DB ---
 print("[INFO] Connecting to ChromaDB...")
+DB_PATH = "./chroma_store"
 client = chromadb.PersistentClient(path=DB_PATH)
-try:
-    apts = client.get_collection(APTS_COLLECTION)
-    students = client.get_collection(STUDENTS_COLLECTION)
-    print("[INFO] Collections loaded.")
-except Exception as e:
-    print(f"[ERROR] Failed to load collections: {e}")
-    print("Please make sure you have run the indexing script first.")
-    exit()
+
+APTS_COLLECTION = "apartments"
+STUDENTS_COLLECTION = "students"
+
+apts_collection = client.get_collection(APTS_COLLECTION)
+students_collection = client.get_collection(STUDENTS_COLLECTION)
+print("[INFO] Collections loaded.")
 
 
-# --- 3. LM Studio client ---
-def run_llm(prompt: str) -> str:
-    """Send prompt to local LM Studio model."""
-    try:
-        resp = requests.post(
-            LMSTUDIO_URL,
-            json={
-                "model": "deepseek-r1-distill-llama-8b",  # must match the model name
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.2,
-                "max_tokens": 1024,
-            },
-            timeout=120,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
-    except requests.exceptions.RequestException as e:
-        print(f"\n[ERROR] Failed to connect to LM Studio at {LMSTUDIO_URL}")
-        print("Please ensure LM Studio is running and the server is on.")
-        return f"ERROR: LLM connection failed: {e}"
+# ======================================================
+# 2. STUDENT FILTERING & CONTEXT
+# ======================================================
+
+def filter_students(docs, metas):
+    filtered = []
+
+    structured_patterns = [
+        r"\bhighly conscientious\b",
+        r"\bhigh conscientiousness\b",
+        r"\bvery conscientious\b",
+        r"\bhigh in conscientiousness\b",
+        r"\bstrict routine\b",
+        r"\bvery strict\b",
+        r"\bhighly structured\b",
+        r"\bvery structured\b",
+        r"\bstructured routine\b",
+        r"\bregimented\b",
+        r"\bstick(s)? to routine\b",
+    ]
+
+    for doc, meta in zip(docs, metas):
+        dog = (meta.get("dog_friendliness") or "").lower()
+        lifestyle = (meta.get("lifestyle_summary") or "").lower()
+        sleep = (meta.get("sleep_schedule") or "").lower()
+        noise = (meta.get("noise_tolerance") or "").lower()
+
+        # 🚫 DOG FILTER
+        if "allergic" in dog or "pet allergic" in dog or "no dogs" in dog:
+            continue
+
+        # 🚫 STRUCTURE FILTER (strong only, via regex)
+        if any(re.search(p, lifestyle) for p in structured_patterns):
+            continue
+
+        # 🚫 NOISE-SENSITIVE EARLY SLEEPER
+        # Example: "10:30pm - wake up early", "noise sensitive"
+        if "noise sensitive" in lifestyle or "noise sensitive" in noise:
+            # Sleep times earlier than 11:00 → reject
+            if "10" in sleep or "10:" in sleep:
+                continue
+
+        raw_name = meta.get("name")
+        if raw_name in [None, "", "not specified"]:
+            name = f"Candidate_{meta.get('chunk_index')}"
+        else:
+            name = raw_name
+
+        # OTHERWISE → Accept
+        filtered.append({
+            "name": name,
+            "personality": meta.get("personality"),
+            "lifestyle": lifestyle,
+            "sleep": sleep,
+            "noise": noise,
+            "dog": dog,
+            "cleanliness": meta.get("cleanliness"),
+            "study": meta.get("study_habits"),
+            "raw": doc,
+            "meta": meta,
+        })
+
+    return filtered
 
 
-def _safe_json_parse(llm_response: str) -> Dict:
-    """
-    Finds and parses the first valid JSON object in a (potentially messy) LLM string.
-    """
-    try:
-        match = re.search(r"\{.*\}", llm_response, re.DOTALL)
-        if not match:
-            print(f"[WARN] No JSON object found in LLM response: {llm_response}")
-            return {}
-        json_string = match.group(0)
-        return json.loads(json_string)
-    except json.JSONDecodeError as e:
-        print(f"[WARN] Failed to decode JSON: {e}")
-        return {}
-    except Exception as e:
-        print(f"[WARN] Unknown error during JSON parse: {e}")
-        return {}
 
-
-# --- Format helpers (UPDATED) ---
-def _format_apartment_context(res: Dict[str, Any]) -> str:
-    """Pretty-print top apartment hits using correct CSV columns."""
-    docs = res["documents"][0]
-    metas = res["metadatas"][0]
+def build_student_context(students: List[Dict[str, Any]]) -> str:
+    if not students:
+        return "No candidates after filtering."
 
     lines = []
-    for doc, meta in zip(docs, metas):
-        # Use the *exact* column names from available_apartments.csv
-        prop_id = meta.get("propertyCode") or f"UNKNOWN_ID_{meta.get('chunk_index', 0)}"
-        hood = meta.get("neighborhood") or meta.get("district") or "Unknown Area"
-        price = meta.get("price") or "Price N/A"
-        url = meta.get("url") or "No URL"
-
-        # Try to get title from the 'suggestedTexts' field
-        # We must parse it, as it's a string representation of a dict
-        title = f"Property {prop_id}"  # Fallback title
-        try:
-            # suggestedTexts might be a string: "{'title': 'Piso...'}"
-            suggested_texts_str = meta.get("suggestedTexts")
-            if suggested_texts_str:
-                # Use regex to find title, safer than eval()
-                title_match = re.search(r"'title':\s*'([^']+)'", suggested_texts_str)
-                if title_match:
-                    title = title_match.group(1)
-        except Exception:
-            pass  # Keep the fallback title
-
-        header_parts = [
-            f"PROPERTY_CODE: {prop_id}",
-            title,
-            f"Neighborhood: {hood}",
-            f"Price: €{price}",
-            f"URL: {url}"
-        ]
-
-        header = " | ".join(header_parts)
-        lines.append(f"- {header}\n  Description: {doc}")
-
-    return "\n\n".join(lines) if lines else "No apartments found in the database."
-
-
-def _format_student_context(res):
-    docs = res["documents"][0]
-    metas = res["metadatas"][0]
-
-    lines = []
-    for doc, meta in zip(docs, metas):
-        # These keys come from your 'extract_students_metadata.py' script
-        name = meta.get("name") or "Unnamed candidate"
-        personality = meta.get("personality", "not specified")
-        lifestyle = meta.get("lifestyle_summary", "not specified")
-        sleep = meta.get("sleep_schedule", "not specified")
-        noise = meta.get("noise_tolerance", "not specified")
-        dog = meta.get("dog_friendliness", "not specified")
-        clean = meta.get("cleanliness", "not specified")
-        study = meta.get("study_habits", "not specified")
-        chunk_idx = meta.get("chunk_index", "?")
-
+    for s in students:
         lines.append(
-            f"- Candidate (chunk {chunk_idx}) — {name}\n"
-            f"  Personality: {personality}\n"
-            f"  Lifestyle: {lifestyle}\n"
-            f"  Sleep schedule: {sleep}\n"
-            f"  Noise tolerance: {noise}\n"
-            f"  Dog friendliness: {dog}\n"
-            f"  Cleanliness: {clean}\n"
-            f"  Study habits: {study}\n"
-            f"  Raw text: {doc[:200]}..."
+            f"- Name: {s['name']}\n"
+            f"  Personality: {s['personality']}\n"
+            f"  Lifestyle: {s['lifestyle']}\n"
+            f"  Sleep: {s['sleep']}\n"
+            f"  Noise tolerance: {s['noise']}\n"
+            f"  Dog friendliness: {s['dog']}\n"
+            f"  Cleanliness: {s['cleanliness']}\n"
+            f"  Study habits: {s['study']}\n"
         )
-
     return "\n\n".join(lines)
 
 
-# --- 4. Main recommend() function ---
-def recommend(query: str, n_apts: int = 3, n_students: int = 6) -> str:
+# ======================================================
+# 3. APARTMENT CONTEXT BUILDER
+# ======================================================
+
+def build_apartment_context(docs: List[str], metas: List[Dict[str, Any]]) -> str:
     """
-    Runs the full RAG pipeline.
+    We do NOT filter here. We just format all retrieved apartments so Gemini
+    can score them against structured + unstructured preferences.
     """
+    if not docs:
+        return "No apartments retrieved."
 
-    # --- Step 0: Disambiguate the Query ---
-    print("[INFO] Step 0: Disambiguating query...")
-    disambiguation_prompt = f"""
-Read the user's request. Separate it into two parts:
-1. The 'apartment_query': The user's preferences for the apartment itself (location, size, price, vibe).
-2. The 'user_profile': The user's description of their own personality and lifestyle (extroverted, messy, etc.).
+    lines = []
+    for doc, meta in zip(docs, metas):
+        prop_id = meta.get("propertyCode")
+        neighborhood = meta.get("neighborhood") or ""
+        district = meta.get("district") or ""
+        price = meta.get("price")
+        rooms = meta.get("rooms")
+        bathrooms = meta.get("bathrooms")
+        size = meta.get("size")
+        exterior = meta.get("exterior")
+        has_lift = meta.get("hasLift")
+        url = meta.get("url")
+        property_type = meta.get("propertyType") or meta.get("type")
 
-Return ONLY a valid JSON object like this:
-{{"apartment_query": "...", "user_profile": "..."}}
+        title = f"Property {prop_id}"
+        stxt = meta.get("suggestedTexts")
 
-User Request:
-"{query}"
-"""
-    llm_response = run_llm(disambiguation_prompt)
-    if "ERROR" in llm_response: return llm_response  # Pass on error
+        if stxt:
+            try:
+                import ast
+                stxt_dict = ast.literal_eval(stxt)
+                if isinstance(stxt_dict, dict):
+                    t = stxt_dict.get("title")
+                    if t:
+                        title = t
+            except:
+                m = re.search(r"'title':\s*'([^']+)'", stxt)
+                if m:
+                    title = m.group(1)
 
-    queries = _safe_json_parse(llm_response)
-
-    apartment_query = queries.get("apartment_query", query)
-    user_profile = queries.get("user_profile", query)
-
-    print(f"[INFO] Apartment Query: {apartment_query}")
-    print(f"[INFO] User Profile: {user_profile}")
-
-    # --- Step 1: Retrieve data from Chroma ---
-    print("[INFO] Step 1: Retrieving data from ChromaDB...")
-    try:
-        apt_emb = embed_query(apartment_query)
-        stu_emb = embed_query(user_profile)
-
-        apt_res = apts.query(
-            query_embeddings=apt_emb,
-            n_results=n_apts,
+        header = (
+            f"PROPERTY_CODE: {prop_id} | {title} | "
+            f"District: {district} | Neighborhood: {neighborhood} | "
+            f"Rooms: {rooms} | Bathrooms: {bathrooms} | Size: {size} m2 | "
+            f"Exterior: {exterior} | Lift: {has_lift} | "
+            f"Price: €{price} | Type: {property_type} | URL: {url}"
         )
+        lines.append(f"- {header}\n  Description: {doc}")
+    return "\n\n".join(lines)
 
-        stu_res = students.query(
-            query_embeddings=stu_emb,
-            n_results=n_students,
+
+# ======================================================
+# 4. JSON SCHEMAS
+# ======================================================
+
+# Apartment query parsing (structured + unstructured)
+apartment_parse_schema: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "apartment_query": {"type": "string"},
+        "structured_filters": {
+            "type": "object",
+            "properties": {
+                "district": {"type": "string"},
+                "neighborhood": {"type": "string"},
+                "min_rooms": {"type": "integer"},
+                "min_bathrooms": {"type": "integer"},
+                "min_size": {"type": "number"},
+                "must_be_exterior": {"type": "boolean"},
+                "must_have_lift": {"type": "boolean"},
+            },
+            "required": [],
+        },
+        "unstructured_preferences": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "roommates": {"type": "integer"},
+        "budget": {"type": "number"},
+    },
+    "required": ["apartment_query"],
+}
+
+# Apartment scoring
+apartment_score_schema: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "apartments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "property_code": {"type": "string"},
+                    "total_score": {"type": "number"},
+                    "reasoning": {"type": "string"},
+                },
+                "required": ["property_code", "total_score", "reasoning"],
+            },
+        }
+    },
+    "required": ["apartments"],
+}
+
+# Roommate scoring
+student_score_schema: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "students": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "score": {"type": "number"},
+                    "reasoning": {"type": "string"},
+                },
+                "required": ["name", "score", "reasoning"],
+            },
+        }
+    },
+    "required": ["students"],
+}
+
+
+# ======================================================
+# 5. APARTMENT RECOMMENDATION FLOW
+# ======================================================
+
+def recommend_apartments(user_query: str, top_k: int = 3) -> str:
+    """
+    Flow:
+      1) Parse user_query into structured_filters + unstructured_preferences + roommates + budget.
+      2) Retrieve apartments from Chroma (semantic).
+      3) Let Gemini score apartments based on:
+         - structured_filters (soft constraints, ignore if empty)
+         - unstructured_preferences (views, quiet, etc., ignore if empty)
+         - effective budget (budget * (roommates + 1) if available)
+      4) Return top_k apartments with best scores.
+    """
+    print("[APT] Step 0: Parsing apartment query with Gemini...")
+
+    parse_prompt = f"""
+    You are given a user request about apartments.
+
+    Extract:
+    1. apartment_query: short cleaned version of their apartment request.
+
+    2. structured_filters:
+       - Only include fields that appear explicitly in the user request.
+       - Valid fields: district, neighborhood, min_rooms, min_bathrooms, min_size, must_be_exterior, must_have_lift.
+       - If the user names multiple neighborhoods or districts (e.g., Salamanca, Retiro, Chamberí), include ALL inside "neighborhood" as a single comma-separated string.
+
+    3. unstructured_preferences:
+       - Soft wishes like “quiet”, “sunset views”, “nice views”, “quiet street”.
+       - Do NOT place neighborhoods here.
+
+    4. roommates: number of roommates (not counting the user).
+    5. budget: monthly budget per person.
+
+    If the user does NOT specify something, leave it null.
+    Do NOT invent constraints.
+
+    User message:
+    \"\"\"{user_query}\"\"\"
+    """
+
+
+    parsed_raw = run_gemini(parse_prompt, json_schema=apartment_parse_schema)
+    if parsed_raw.startswith("ERROR"):
+        return parsed_raw
+
+    try:
+        parsed_clean = clean_json(parsed_raw)
+        parsed = json.loads(parsed_clean)
+    except Exception as e:
+        return f"ERROR: Failed to parse apartment parse JSON: {e}\nRaw: {parsed_raw}"
+
+    apt_query = parsed.get("apartment_query") or user_query
+    structured = parsed.get("structured_filters") or {}
+    prefs = parsed.get("unstructured_preferences") or []
+    roommates = parsed.get("roommates")
+    budget_per_person = parsed.get("budget")
+
+    # effective total budget
+    effective_budget = None
+    total_people = (roommates + 1) if isinstance(roommates, int) and roommates > 0 else None
+
+    if isinstance(budget_per_person, (int, float)) and total_people:
+        effective_budget = budget_per_person * total_people
+    # else: keep None (means "no budget constraint")
+    print(f"[APT] Parsed structured: {structured}")
+    print(f"[APT] Parsed prefs: {prefs}")
+    print(f"[APT] Roommates: {roommates}, budget_per_person: {budget_per_person}, effective_budget: {effective_budget}")
+
+    # --- NEW: Prepare Chroma filter (the `where` clause) ---
+    chroma_filter = {}
+    neigh_raw = structured.get("neighborhood")  # Still using this parsed field
+
+    # Logic to build the $or filter based on requested districts
+    if neigh_raw:
+        # 1. Clean and separate the list (e.g., ['salamanca', 'retiro'])
+        requested_areas_clean = [n.strip() for n in neigh_raw.split(",")]
+
+        area_conditions = []
+        for area in requested_areas_clean:
+            # 2. Try matching the exact case (e.g., 'Salamanca')
+            area_conditions.append({"district": area})
+
+            # 3. Also try Title Case for robustness (e.g., 'Salamanca')
+            area_conditions.append({"district": area.title()})
+
+            # 4. Also try lowercase (just in case the indexer lowercased it)
+            area_conditions.append({"district": area.lower()})
+
+        if area_conditions:
+            # We use an OR clause to accept ANY of the requested areas in ANY of the casings
+            chroma_filter = {"$or": area_conditions}
+
+    # Print the filter object for final verification
+    print(f"[DEBUG] Chroma Filter Object: {chroma_filter}")
+
+    # 1) Retrieve from Chroma (semantic + structured filter)
+    print("[APT] Step 1: Retrieving apartments from Chroma with District/Neighborhood filter...")
+    try:
+        apt_res = apts_collection.query(
+            query_embeddings=embed_query(apt_query),
+            # 🎯 Key Change: Use a reasonable number like 15 to control token usage
+            n_results=5,
+            # Inject the filter here
+            where=chroma_filter if chroma_filter else None,
         )
     except Exception as e:
-        print(f"[ERROR] ChromaDB query failed: {e}")
-        return f"ERROR: ChromaDB query failed: {e}"
+        return f"ERROR: Chroma query failed: {e}"
 
-    apt_context = _format_apartment_context(apt_res)
-    stu_context = _format_student_context(stu_res)
+    if not apt_res["documents"]:
+        return "No apartments found matching both the filter and the semantic query."
 
-    # --- Step 2: LLM Synthesis (UPDATED PROMPT) ---
-    print("[INFO] Step 2: Sending data to LLM for final synthesis...")
-    prompt = f"""
-You are an expert roommate-matching AI. Your task is to find the best roommate and apartment for the user.
+    apt_docs = apt_res["documents"][0]
+    apt_metas = apt_res["metadatas"][0]
 
-USER PROFILE:
-\"\"\"{user_profile}\"\"\"
+    # 🎯 DEBUG PRINT A: Check how many docs were retrieved
+    print(f"[DEBUG] Retrieved {len(apt_docs)} apartments from Chroma.")
 
----
-APARTMENTS AVAILABLE (Context):
-{apt_context}
+    # 🎯 DEBUG PRINT B: Check metadata of the first document to verify filtering
+    if apt_metas:
+        first_meta = apt_metas[0]
+        print(
+            f"[DEBUG] First apartment meta (Neighborhood, District): {first_meta.get('neighborhood')}, {first_meta.get('district')}")
+    else:
+        print("[DEBUG] No metadata available for retrieved documents.")
 
----
-POTENTIAL ROOMMATE CANDIDATES (Context):
-{stu_context}
+    # NEW: summarize the descriptions using your local LM Studio model
+    summarized_docs = []
+    for d in apt_docs:
+        try:
+            summarized_docs.append(summarize_description(d))
+        except Exception as e:
+            print(f"[WARN] Summarization failed for one doc: {e}")
+            summarized_docs.append(d[:200])  # fallback to short truncation
 
----
-TASK:
-First, summarize the user's key traits in 2 bullet points.
-Second, analyze each candidate one-by-one by *directly comparing* them to the user.
+    # Build context with summarized texts
+    apt_context = build_apartment_context(summarized_docs, apt_metas)
 
-**User Key Traits:**
-* **Social:** [Summarize the user's social habits]
-* **Lifestyle:** [Summarize the user's cleanliness and daily routine]
+    # --- Build dynamic clauses for scoring prompt ---
+    neigh_raw = structured.get("neighborhood")
+    if neigh_raw:
+        requested_neighs = [n.strip().lower() for n in neigh_raw.split(",")]
+        neighborhood_clause = f"- Preferred neighborhoods: {', '.join(requested_neighs)}"
+    else:
+        requested_neighs = []
+        neighborhood_clause = ""
 
----
-**Candidate Analysis:**
-
-**1. Candidate: [Name]**
-* **Social Match:** [Compare the user's social trait to this candidate's. Is it a good or bad match?]
-* **Lifestyle Match:** [Compare the user's lifestyle/cleanliness trait to this candidate's. Is it a good or bad match?]
-* **Verdict:** [State "Good Match", "Neutral Match", or "Bad Match"]
-* **Reasoning:** [1-2 sentences explaining your verdict.]
-
-**2. Candidate: [Name]**
-* **Social Match:** [Compare...]
-* **Lifestyle Match:** [Compare...]
-* **Verdict:** [State...]
-* **Reasoning:** [Explain...]
-
-(Repeat this analysis for ALL candidates)
-
----
-**Final Recommendation:**
-Based on your side-by-side analysis, identify the #1 Best Roommate and the #1 Best Apartment.
-
-You MUST output the apartment's `PROPERTY_CODE` and `URL` exactly as they were given.
-
-Format your answer like this:
-
-**Best Roommate:** [Candidate Name]
-**Best Apartment PROPERTY_CODE:** [The exact PROPERTY_CODE from the context]
-**Best Apartment URL:** [The exact URL from the context]
-**Recommendation:** [1-2 sentences justifying why this pair and apartment are a good fit.]
-"""
-
-    return run_llm(prompt)
-
-
-# --- Manual test ---
-if __name__ == "__main__":
-    q = (
-        "I want a quiet big dog friendly apartment in barrio Salamanca with a budget of "
-        "3300 euros a month max. I want my own private bathroom and sunset views. "
-        "I am very extroverted, not very organised and spontaneous, and I cannot handle "
-        "people that are too structured."
+    exterior_clause = (
+        "- Must be exterior"
+        if structured.get("must_be_exterior") else ""
     )
 
-    print("--- Running Recommendation Engine ---")
-    recommendation = recommend(q)
-    print("\n--- FINAL RECOMMENDATION ---")
-    print(recommendation)
+    lift_clause = (
+        "- Must have lift"
+        if structured.get("must_have_lift") else ""
+    )
+
+    soft_prefs_list = (
+        "- Soft preferences: " + ", ".join(prefs)
+        if prefs else ""
+    )
+
+    print("[APT] Step 2: Scoring apartments with Gemini...")
+
+    # Important: this scoring prompt is GENERIC, not hard-coded to Salamanca, etc.
+    score_prompt = f"""
+You MUST output ONLY valid JSON. 
+No commentary, no markdown, no explanations, no text before or after.
+If quotes appear inside strings, ESCAPE them.
+Never insert newlines inside JSON strings.
+Never add trailing commas.
+Never invent metadata that is not explicitly provided.
+
+You are evaluating a list of apartments for the user.
+
+USER REQUIREMENTS:
+Structured:
+- Max total budget: €{effective_budget if effective_budget else "None"}
+{neighborhood_clause}
+{exterior_clause}
+{lift_clause}
+
+Unstructured preferences (soft filters — soft only):
+{soft_prefs_list}
+
+SCORING RULES (0–10 total):
+- +2 fits budget
+- +2 exterior / light / views
+- +2 lift if required
+- +2 if description contains soft preferences
+- Neighborhood match:
+    - +2 if neighborhood matches ANY preferred neighborhoods
+    - +1 if district matches but neighborhood doesn’t
+    - +0 otherwise
+
+OUTPUT FORMAT (STRICT JSON):
+{{
+  "apartments": [
+    {{
+      "property_code": "code_here",
+      "total_score": number_here,
+      "reasoning": "short explanation, 1–2 sentences max"
+    }}
+  ]
+}}
+
+The array MUST include one object per apartment.
+
+APARTMENTS TO EVALUATE:
+{apt_context}
+"""
+    print(score_prompt)
+
+    # --- Step 2: Ask Gemini for JSON scoring ---
+    score_raw = run_gemini(score_prompt, json_schema=apartment_score_schema)
+    if score_raw.startswith("ERROR"):
+        return score_raw
+
+    # --- Step 3: Sanitize Gemini mistakes BEFORE parsing ---
+    cleaned = score_raw.strip()
+    cleaned = cleaned.replace("\n", " ").replace("\t", " ")
+
+    # Remove trailing commas (common Gemini issue)
+    cleaned = re.sub(r",\s*}", "}", cleaned)
+    cleaned = re.sub(r",\s*]", "]", cleaned)
+
+    # Remove accidental spaces after/before quotes
+    cleaned = re.sub(r'"\s+', '"', cleaned)
+    cleaned = re.sub(r'\s+"', '"', cleaned)
+
+    # Use your existing helper to remove markdown fences etc.
+    cleaned = clean_json(cleaned)
+
+    # --- Step 4: Parse JSON safely ---
+    try:
+        scores = json.loads(cleaned)
+    except Exception as e:
+        return f"ERROR: Failed to parse apartment scores JSON: {e}\nRaw: {cleaned}"
+
+    scored_list = scores.get("apartments") or []
+    if not scored_list:
+        return "No apartment scores returned by LLM."
+
+    # 3) Rank and take top_k
+    scored_list.sort(key=lambda x: x.get("total_score", 0), reverse=True)
+    top = scored_list[:top_k]
+
+    # Build lookup for URLs (always use strings for keys)
+    meta_by_code = {
+        str(m.get("propertyCode")): m
+        for m in apt_metas
+        if m.get("propertyCode") is not None
+    }
+
+    lines = []
+    for item in top:
+        code = str(item["property_code"])
+        meta = meta_by_code.get(code, {})
+        url = meta.get("url", "None")
+        price = meta.get("price", "N/A")
+        district = meta.get("district", "")
+        neighborhood = meta.get("neighborhood", "")
+        lines.append(
+            f"- PROPERTY_CODE: {code} | District: {district} | Neighborhood: {neighborhood} | "
+            f"Price: €{price} | URL: {url}\n"
+            f"  Score: {item['total_score']:.2f} | Reason: {item['reasoning']}"
+        )
+
+    return "Top apartment matches:\n" + "\n\n".join(lines)
+
+
+# ======================================================
+# 6. ROOMMATE RECOMMENDATION FLOW
+# ======================================================
+
+def recommend_roommates(user_profile_query: str, top_k: int = 3) -> str:
+    """
+    Flow for roommate recommendation:
+      1) Retrieve candidates using user_profile_query.
+      2) Filter out clearly incompatible students (dog-allergic, highly structured).
+      3) Let Gemini score compatibility and return top_k.
+    """
+    print("[RM] Retrieving roommate candidates from Chroma...")
+
+    try:
+        stu_res = students_collection.query(
+            query_embeddings=embed_query(user_profile_query),
+            n_results=10,
+        )
+    except Exception as e:
+        return f"ERROR: Chroma query failed: {e}"
+
+    if not stu_res["documents"]:
+        return "No roommate candidates found in database."
+
+    stu_docs = stu_res["documents"][0]
+    stu_metas = stu_res["metadatas"][0]
+
+    students = filter_students(stu_docs, stu_metas)
+    if not students:
+        return "No compatible roommate candidates after basic filtering."
+
+    stu_context = build_student_context(students)
+
+    print("[RM] Scoring roommates with Gemini...")
+
+    rm_prompt = f"""
+You are matching roommates.
+
+User profile:
+\"\"\"{user_profile_query}\"\"\"
+
+Below are candidate students with their traits and lifestyles.
+
+Score each candidate from 0 to 10 based on:
+- social and personality fit,
+- tolerance for spontaneity / mess if relevant,
+- dog-friendliness if relevant,
+- sleep and noise compatibility if described in the profile.
+
+If the user profile does not specify a constraint (e.g., doesn't mention dogs),
+ignore that dimension (do not penalize or reward).
+
+OUTPUT FORMAT (PLAIN TEXT, NO JSON):
+
+Write ONE line per candidate exactly as follows:
+NAME | SCORE | REASON
+
+Where:
+- NAME is the candidate's name exactly as shown
+- SCORE is a number from 0 to 10
+- REASON is a short justification (1 sentence)
+
+Example:
+Alex | 9 | Very compatible lifestyle, social schedule aligns.
+Maria | 5.5 | Some compatibility but more structured than user.
+
+Do NOT add headers.
+Do NOT wrap in JSON.
+Do NOT add extra text.
+
+
+
+
+
+CANDIDATES:
+{stu_context}
+"""
+
+
+    def parse_student_scores(text: str) -> List[Dict[str, Any]]:
+        results = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or "|" not in line:
+                continue
+            parts = [p.strip() for p in line.split("|", 2)]
+            if len(parts) < 3:
+                continue
+            name, score_str, reason = parts
+            try:
+                score = float(score_str)
+            except ValueError:
+                continue
+            results.append({
+                "name": name,
+                "score": score,
+                "reasoning": reason
+            })
+        return results
+
+    rm_raw = run_gemini(rm_prompt)
+    if rm_raw.startswith("ERROR"):
+        return rm_raw
+
+    scored_students = parse_student_scores(rm_raw)
+    if not scored_students:
+        return f"No roommate scores returned.\nRaw output:\n{rm_raw}"
+
+
+    scored_students.sort(key=lambda x: x.get("score", 0), reverse=True)
+    top = scored_students[:top_k]
+
+    lines = []
+    for s in top:
+        lines.append(
+            f"- Name: {s['name']} | Score: {s['score']:.2f}\n"
+            f"  Reason: {s['reasoning']}"
+        )
+
+    return "Top roommate matches:\n" + "\n\n".join(lines)
+
+
+# ======================================================
+# 7. MANUAL TESTS
+# ======================================================
+
+if __name__ == "__main__":
+    apt_q = (
+        "I want a flat to rent in Madrid, ideally in Salamanca or Retiro, "
+        "around 1500€ per person with 2 roommates (so 3 people total). "
+        "I care about quiet streets and nice views, and I prefer exterior with lift."
+    )
+    print("--- Testing apartment recommendation ---")
+    print(recommend_apartments(apt_q, top_k=3))
+
+    rm_q = (
+        "I am very extroverted, spontaneous, not very organized, and I can't stand "
+        "people who are extremely structured or uptight. I like some socializing at home, "
+        "and I am okay with dogs."
+    )
+    print("\n--- Testing roommate recommendation ---")
+    print(recommend_roommates(rm_q, top_k=3))
+
+
+

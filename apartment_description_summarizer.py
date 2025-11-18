@@ -41,6 +41,6 @@ def summarize_description(text: str) -> str:
     # Remove markdown if the model decides to add it (some small models do this)
     content = content.replace("```", "").replace("json", "").strip()
 
-    return content
+    return content[25:]
 
 

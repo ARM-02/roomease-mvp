@@ -1,279 +1,210 @@
 import streamlit as st
-import sys
-import os
-
-# Add current directory to path
-sys.path.insert(0, os.path.dirname(__file__))
+import time
 
 # Page config
 st.set_page_config(
-    page_title="Roommate & Apartment Finder",
+    page_title="AI Roommate Matcher",
     page_icon="🏠",
-    layout="wide"
+    layout="centered"
 )
 
-# Custom CSS for better styling
+# Custom CSS for the chat interface
 st.markdown("""
     <style>
+    /* General Styling - Fix for white background */
     html, body, [class*="st"] {
-        color: white !important;
-        background-color: #0e1117;
+        color: #31333F !important; /* Dark charcoal for high readability */
     }
 
-    .section-header {
-        font-size: 2rem;
+    /* Chat Message Styling */
+    .stChatMessage {
+        background-color: transparent; 
+    }
+
+    /* User Message Bubble */
+    .stChatMessage[data-testid="stChatMessage"]:nth-child(odd) {
+        background-color: #f0f2f6; /* Light grey bubble for user */
+        border: 1px solid #e0e0e0;
+        border-radius: 15px;
+        padding: 15px;
+        margin-bottom: 10px;
+    }
+
+    /* Assistant Message Bubble */
+    .stChatMessage[data-testid="stChatMessage"]:nth-child(even) {
+        background-color: transparent;
+        padding-top: 10px;
+        padding-bottom: 10px;
+    }
+
+    /* Header Styling */
+    h1 {
+        background: -webkit-linear-gradient(45deg, #4CAF50, #2E7D32);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-weight: 800 !important;
+        text-align: center; /* Center the title */
+        padding-bottom: 20px;
+    }
+
+    /* Highlight bold text in assistant messages */
+    strong {
+        color: #2E7D32;
         font-weight: 700;
-        margin-top: 2rem;
-        margin-bottom: 1rem;
-        color: white;
     }
 
-    label, p, .stMarkdown, .stTextInput label {
-        font-size: 1.2rem !important;
-        color: white !important;
-        font-weight: 500 !important;
-        line-height: 1.6;
-    }
+    /* Hide default hamburger menu and footer for cleaner look */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
 
-    .stTextInput > div > div > input,
-    .stTextArea > div > div > textarea {
-        border-radius: 8px;
-        border: 2px solid #e0e0e0;
-        padding: 0.75rem;
-        font-size: 1.1rem;
-        color: white;
-        background-color: #262730;
-    }
-
-    .stButton>button {
-        width: 100%;
-        background-color: #4CAF50;
-        color: white;
-        padding: 1rem;
-        font-size: 1.2rem;
-        border-radius: 10px;
-        margin-top: 2rem;
-        font-weight: 600;
-    }
-
-    .stButton>button:hover {
-        background-color: #45a049;
-    }
-
-    .element-container {
-        margin-bottom: 1.5rem;
-    }
     </style>
 """, unsafe_allow_html=True)
 
-# Try to import the recommend function
+# --- Backend Import Handling ---
 try:
-    from rag_backend1 import recommend
+    from backend.rag_backend import recommend_apartments, recommend_roommates
 
-    import_success = True
+    backend_available = True
 except Exception as e:
-    import_success = False
-    st.error(f"""
-    ⚠️ **Cannot import the recommendation function!**
+    backend_available = False
+    st.error(f"⚠️ Backend unavailable. Check imports/keys. Error: {e}")
 
-    Error: {str(e)}
+# --- Session State Initialization ---
+if "messages" not in st.session_state:
+    st.session_state.messages = [
+        {"role": "assistant",
+         "content": "Hi there! 👋 I'm your AI Roommate & Apartment Finder. To find your perfect match, I need to get to know you a little better. \n\nFirst things first, what is your **name**?"}
+    ]
 
-    **Please make sure:**
-    1. `rag_backend1.py` is in the same folder as `app.py`
-    2. Your ChromaDB folder `chroma_store` exists
-    3. All required packages are installed
-    4. Your Gemini API key is set
+if "current_step" not in st.session_state:
+    st.session_state.current_step = 0
 
-    **Try running this in terminal:**
-    ```
-    export GEMINI_API_KEY="your_api_key_here"
-    pip install chromadb sentence-transformers google-generativeai
-    ```
-    """)
-    st.stop()
+if "user_data" not in st.session_state:
+    st.session_state.user_data = {}
 
-# Initialize session state
-if 'submitted' not in st.session_state:
-    st.session_state.submitted = False
-if 'recommendation' not in st.session_state:
-    st.session_state.recommendation = None
+if "finished" not in st.session_state:
+    st.session_state.finished = False
 
-# Title
-st.title("🏠 Roommate & Apartment Finder")
-st.markdown("### Find your perfect living situation based on your personality and preferences")
-st.markdown("---")
+# --- Conversation Flow Definition ---
+# Each step maps to a key in user_data and the NEXT question to ask
+conversation_steps = [
+    {"key": "name",
+     "next_q": "Nice to meet you! 🏢 Now, tell me about your **ideal apartment**. \n\nInclude details like location, budget per person, pet-friendliness, amenities and how many roommates you want (e.g., 'Barrio Salamanca, under €900, needs a balcony, max 2 roommates')."},
+    {"key": "apartment_desc",
+     "next_q": "Got it. Now let's talk personality to find compatible roommates. \n\n1. Do you like trying **new experiences** and foods, or do you prefer sticking to routines you enjoy?"},
+    {"key": "q1", "next_q": "2. How do you feel about **spontaneous plans** or surprises?"},
+    {"key": "q2", "next_q": "3. Are you super **organized** and plan ahead, or do you prefer to go with the flow?"},
+    {"key": "q3", "next_q": "4. How **punctual** are you usually for classes or appointments?"},
+    {"key": "q4",
+     "next_q": "5. After a long day, do you prefer **chatting** with roommates or having **quiet time** alone?"},
+    {"key": "q5", "next_q": "6. How do you feel about hosting **gatherings/parties** at the apartment?"},
+    {"key": "q6", "next_q": "7. When **conflicts** arise, do you stand your ground or look for a compromise?"},
+    {"key": "q7", "next_q": "8. Would you describe yourself as **patient** and easygoing?"},
+    {"key": "q8", "next_q": "9. How do you handle **stress** (like exams or noisy neighbors)?"},
+    {"key": "q9", "next_q": "10. Finally, how much **alone time** do you need to recharge?"},
+    {"key": "q10", "next_q": "Thanks! I have everything I need. Type 'Ready' to generate your matches! 🚀"}
+]
 
-# Name Section
-st.markdown('<div class="section-header">👤 Tell us about yourself</div>', unsafe_allow_html=True)
-name = st.text_input("What's your name?", placeholder="Enter your name", key="name_input")
+# --- UI Layout ---
 
-st.markdown("<br>", unsafe_allow_html=True)
+st.title("🏠 Roommate Finder Chat")
 
-# Apartment Section
-st.markdown('<div class="section-header">🏢 Your Ideal Apartment</div>', unsafe_allow_html=True)
-st.markdown(
-    "Tell us what you're looking for - vibe, location, price range, dealbreakers, or anything that matters to you.")
-apartment_desc = st.text_area(
-    "My ideal apartment...",
-    placeholder="Example: I want a quiet, dog-friendly apartment in Barrio Salamanca with a budget of €3,300 max. I need my own private bathroom and would love sunset views.",
-    height=120,
-    key="apartment_input",
-    label_visibility="collapsed"
-)
+# 1. Display Chat History
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-st.markdown("<br><br>", unsafe_allow_html=True)
+# 2. Handle User Input
+if not st.session_state.finished:
+    if prompt := st.chat_input("Type your answer here..."):
+        # Display user message immediately
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        st.session_state.messages.append({"role": "user", "content": prompt})
 
-# Personality Questions Section
-st.markdown('<div class="section-header">💭 Personality Questions</div>', unsafe_allow_html=True)
-st.markdown("Answer these questions so we can match you with compatible roommates. Be honest and specific!")
+        # Process current step
+        current_idx = st.session_state.current_step
 
-st.markdown("<br>", unsafe_allow_html=True)
+        # If we are within the question range
+        if current_idx < len(conversation_steps):
+            step_info = conversation_steps[current_idx]
 
-# Question 1
-q1 = st.text_area(
-    "1️⃣ Do you like trying new experiences, foods, or activities — or do you prefer routines you already enjoy?",
-    placeholder="Your answer...",
-    height=80,
-    key="q1"
-)
+            # Store the answer
+            st.session_state.user_data[step_info["key"]] = prompt
 
-# Question 2
-q2 = st.text_area(
-    "2️⃣ How do you feel about spontaneous plans or surprises?",
-    placeholder="Your answer...",
-    height=80,
-    key="q2"
-)
+            # Prepare next assistant message
+            next_question = step_info["next_q"]
 
-# Question 3
-q3 = st.text_area(
-    "3️⃣Do you like to keep your space organized and plan your day ahead, or do you go with the flow?",
-    placeholder="Your answer...",
-    height=80,
-    key="q3"
-)
+            # Simulate "typing" delay for realism
+            time.sleep(0.4)
 
-# Question 4
-q4 = st.text_area(
-    "4️⃣How punctual are you for classes or appointments?",
-    placeholder="Your answer...",
-    height=80,
-    key="q4"
-)
-
-# Question 5
-q5 = st.text_area(
-    "5️⃣When you come home after a long day, do you enjoy chatting with roommates or prefer quiet time alone?",
-    placeholder="Your answer...",
-    height=80,
-    key="q5"
-)
-
-# Question 6
-q6 = st.text_area(
-    "6️⃣Would you enjoy hosting small gatherings or prefer a calm apartment?",
-    placeholder="Your answer...",
-    height=80,
-    key="q6"
-)
-
-# Question 7
-q7 = st.text_area(
-    "7️⃣When conflicts arise, do you usually try to find compromise or prefer to stand your ground?",
-    placeholder="Your answer...",
-    height=80,
-    key="q7"
-)
-
-# Question 8
-q8 = st.text_area(
-    "8️⃣Would you describe yourself as easygoing and patient?",
-    placeholder="Your answer...",
-    height=80,
-    key="q8"
-)
-
-# Question 9
-q9 = st.text_area(
-    "9️⃣When things go wrong (like a noisy neighbor or exam stress), do you get anxious easily or stay calm?",
-    placeholder="Your answer...",
-    height=80,
-    key="q9"
-)
-
-# Question 10
-q10 = st.text_area(
-    "1️⃣0️⃣How often do you need alone time to recharge?",
-    placeholder="Your answer...",
-    height=80,
-    key="q10"
-)
-
-# Submit button
-st.markdown("---")
-submit_button = st.button("🔍 Find My Perfect Match!")
-
-if submit_button:
-    # Validate inputs
-    if not name or not name.strip():
-        st.error("⚠️ Please enter your name!")
-    elif not apartment_desc or not apartment_desc.strip():
-        st.error("⚠️ Please describe what you're looking for in an apartment!")
-    elif not all([q1, q2, q3, q4, q5, q6, q7, q8, q9, q10]):
-        st.error("⚠️ Please answer all 10 personality questions!")
-    elif any(len(q.strip()) < 10 for q in [q1, q2, q3, q4, q5, q6, q7, q8, q9, q10]):
-        st.error("⚠️ Please provide more detailed answers to the questions (at least a sentence each)!")
-    else:
-        # Construct the query from all inputs
-        query = f"""
-My name is {name}.
-
-Apartment preferences: {apartment_desc}
-
-Personality profile:
-1. New experiences and routines: {q1}
-2. Spontaneity and surprises: {q2}
-3. Organization and planning: {q3}
-4. Punctuality: {q4}
-5. Social energy after work: {q5}
-6. Hosting and gatherings: {q6}
-7. Conflict resolution style: {q7}
-8. Patience and temperament: {q8}
-9. Stress response: {q9}
-10. Alone time needs: {q10}
-"""
-
-        with st.spinner("🔄 Analyzing your profile and finding the best matches... This may take a moment."):
-            try:
-                # Call your recommendation function
-                recommendation = recommend(query)
-                st.session_state.recommendation = recommendation
-                st.session_state.submitted = True
-                st.rerun()
-            except Exception as e:
-                st.error(f"❌ An error occurred while getting recommendations: {str(e)}")
-                st.error("Please check that your ChromaDB database is properly set up and your API key is configured.")
-
-# Display results
-if st.session_state.submitted and st.session_state.recommendation:
-    st.markdown("---")
-    st.markdown('<div class="section-header">✨ Your Personalized Recommendations</div>', unsafe_allow_html=True)
-
-    # Display the recommendation in a nice box
-    st.markdown("""
-        <div style='background-color: #f8f9fa; padding: 2rem; border-radius: 12px; margin-top: 1.5rem; border: 2px solid #e0e0e0;'>
-    """, unsafe_allow_html=True)
-
-    st.markdown(st.session_state.recommendation)
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # Reset button
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col2:
-        if st.button("🔄 Start Over"):
-            st.session_state.submitted = False
-            st.session_state.recommendation = None
+            st.session_state.messages.append({"role": "assistant", "content": next_question})
+            st.session_state.current_step += 1
             st.rerun()
+
+        # If we are at the end (Trigger generation)
+        else:
+            st.session_state.finished = True
+            st.rerun()
+
+# 3. Logic for Results Generation
+if st.session_state.finished:
+    if not backend_available:
+        st.error("Backend functionality is missing. Cannot generate matches.")
+    else:
+        # Only run this once
+        if "results_apt" not in st.session_state:
+            with st.chat_message("assistant"):
+                with st.spinner("🧠 Analyzing your personality profile and apartment database..."):
+
+                    # Construct Queries (Matching original logic)
+                    data = st.session_state.user_data
+
+                    apartment_query = f"""
+                    My name is {data.get('name')}.
+                    Apartment preferences: {data.get('apartment_desc')} 
+                    """
+
+                    rm_query = f"""
+                    Personality profile:
+                    1. New experiences: {data.get('q1')}
+                    2. Spontaneity: {data.get('q2')}
+                    3. Organization: {data.get('q3')}
+                    4. Punctuality: {data.get('q4')}
+                    5. Social energy: {data.get('q5')}
+                    6. Hosting: {data.get('q6')}
+                    7. Conflict: {data.get('q7')}
+                    8. Patience: {data.get('q8')}
+                    9. Stress: {data.get('q9')}
+                    10. Alone time: {data.get('q10')}
+                    """
+
+                    try:
+                        # Fetch recommendations
+                        res_apt = recommend_apartments(apartment_query, top_k=3)
+                        res_rm = recommend_roommates(rm_query, top_k=3)
+
+                        st.session_state.results_apt = res_apt
+                        st.session_state.results_rm = res_rm
+
+                    except Exception as e:
+                        st.error(f"Error during recommendation: {e}")
+
+        # Display Results if they exist
+        if "results_apt" in st.session_state:
+            st.markdown("---")
+            st.success("✅ Matches Found!")
+
+            tab1, tab2 = st.tabs(["🏢 Apartments", "👥 Roommates"])
+
+            with tab1:
+                st.markdown(st.session_state.results_apt)
+
+            with tab2:
+                st.markdown(st.session_state.results_rm)
+
+            # Restart Button
+            if st.button("🔄 Start New Chat"):
+                for key in list(st.session_state.keys()):
+                    del st.session_state[key]
+                st.rerun()

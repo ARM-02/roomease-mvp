@@ -92,15 +92,35 @@ Rules:
 Text:
 """
 
+
 def extract_student_metadata(block: str) -> Dict:
+    # 🎯 REFINED HEURISTIC: Find the name following "STUDENT X" or "STUDENT X -"
+
+    # Pattern looks for:
+    # 1. "STUDENT " followed by 1 or more digits (X)
+    # 2. OPTIONAL: whitespace and a hyphen (to catch "STUDENT 41 - Camila Moreira")
+    # 3. CAPTURE GROUP 1: The name, starting with an uppercase letter, followed by
+    #    at least one other word (First Name Last Name)
+    name_match = re.search(r"STUDENT\s+\d+\s*\-*\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)", block)
+
+    # Clean up the captured name (sometimes includes surrounding spaces or noise)
+    fallback_name = normalize_space(name_match.group(1)) if name_match else None
+
     prompt = EXTRACTION_PROMPT + "\n" + block
     try:
-        return ask_local_llm(prompt)
+        meta = ask_local_llm(prompt)
+
+        # FIX: If the LLM returned "not specified" for the name, use the fallback
+        if meta.get("name") in [None, "not specified", ""]:
+            meta["name"] = fallback_name
+
+        return meta
+
     except Exception as e:
         print(f"[WARN] Extraction failed for one block: {e}")
-        # Fallback: neutral defaults
+        # Fallback: neutral defaults, but include the heuristically extracted name
         return {
-            "name": None,
+            "name": fallback_name,  # Use the heuristically extracted name here
             "personality": "not specified",
             "lifestyle_summary": "not specified",
             "sleep_schedule": "not specified",
@@ -177,3 +197,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
