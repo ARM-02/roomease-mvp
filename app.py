@@ -131,7 +131,7 @@ st.markdown("<br>", unsafe_allow_html=True)
 
 # Question 1
 q1 = st.text_area(
-    "1. Do you like trying new experiences, foods, or activities — or do you prefer routines you already enjoy?",
+    "1️⃣ Do you like trying new experiences, foods, or activities — or do you prefer routines you already enjoy?",
     placeholder="Your answer...",
     height=80,
     key="q1"
@@ -139,7 +139,7 @@ q1 = st.text_area(
 
 # Question 2
 q2 = st.text_area(
-    "2. How do you feel about spontaneous plans or surprises?",
+    "2️⃣ How do you feel about spontaneous plans or surprises?",
     placeholder="Your answer...",
     height=80,
     key="q2"
@@ -147,7 +147,7 @@ q2 = st.text_area(
 
 # Question 3
 q3 = st.text_area(
-    "3. Do you like to keep your space organized and plan your day ahead, or do you go with the flow?",
+    "3️⃣Do you like to keep your space organized and plan your day ahead, or do you go with the flow?",
     placeholder="Your answer...",
     height=80,
     key="q3"
@@ -155,7 +155,7 @@ q3 = st.text_area(
 
 # Question 4
 q4 = st.text_area(
-    "4. How punctual are you for classes or appointments?",
+    "4️⃣How punctual are you for classes or appointments?",
     placeholder="Your answer...",
     height=80,
     key="q4"
@@ -163,7 +163,7 @@ q4 = st.text_area(
 
 # Question 5
 q5 = st.text_area(
-    "5. When you come home after a long day, do you enjoy chatting with roommates or prefer quiet time alone?",
+    "5️⃣When you come home after a long day, do you enjoy chatting with roommates or prefer quiet time alone?",
     placeholder="Your answer...",
     height=80,
     key="q5"
@@ -171,7 +171,7 @@ q5 = st.text_area(
 
 # Question 6
 q6 = st.text_area(
-    "6. Would you enjoy hosting small gatherings or prefer a calm apartment?",
+    "6️⃣Would you enjoy hosting small gatherings or prefer a calm apartment?",
     placeholder="Your answer...",
     height=80,
     key="q6"
@@ -179,7 +179,7 @@ q6 = st.text_area(
 
 # Question 7
 q7 = st.text_area(
-    "7. When conflicts arise, do you usually try to find compromise or prefer to stand your ground?",
+    "7️⃣When conflicts arise, do you usually try to find compromise or prefer to stand your ground?",
     placeholder="Your answer...",
     height=80,
     key="q7"
@@ -187,7 +187,7 @@ q7 = st.text_area(
 
 # Question 8
 q8 = st.text_area(
-    "8. Would you describe yourself as easygoing and patient?",
+    "8️⃣Would you describe yourself as easygoing and patient?",
     placeholder="Your answer...",
     height=80,
     key="q8"
@@ -195,7 +195,7 @@ q8 = st.text_area(
 
 # Question 9
 q9 = st.text_area(
-    "9. When things go wrong (like a noisy neighbor or exam stress), do you get anxious easily or stay calm?",
+    "9️⃣When things go wrong (like a noisy neighbor or exam stress), do you get anxious easily or stay calm?",
     placeholder="Your answer...",
     height=80,
     key="q9"
@@ -203,7 +203,7 @@ q9 = st.text_area(
 
 # Question 10
 q10 = st.text_area(
-    "10. How often do you need alone time to recharge?",
+    "1️⃣0️⃣How often do you need alone time to recharge?",
     placeholder="Your answer...",
     height=80,
     key="q10"
