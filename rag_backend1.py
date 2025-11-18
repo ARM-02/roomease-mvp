@@ -60,7 +60,7 @@ def run_gemini(prompt: str, json_schema: Optional[Dict] = None) -> str:
     try:
         gen_config: Dict[str, Any] = {
             "temperature": 0.2,
-            "max_output_tokens": 2048,
+            "max_output_tokens": 4096,
         }
 
         if json_schema is not None:
@@ -405,21 +405,62 @@ def recommend_apartments(user_query: str, top_k: int = 3) -> str:
     print(f"[APT] Parsed prefs: {prefs}")
     print(f"[APT] Roommates: {roommates}, budget_per_person: {budget_per_person}, effective_budget: {effective_budget}")
 
-    # 1) Retrieve from Chroma (semantic)
-    print("[APT] Step 1: Retrieving apartments from Chroma...")
+    # --- NEW: Prepare Chroma filter (the `where` clause) ---
+    chroma_filter = {}
+    neigh_raw = structured.get("neighborhood")  # Still using this parsed field
+
+    # Logic to build the $or filter based on requested districts
+    if neigh_raw:
+        # 1. Clean and separate the list (e.g., ['salamanca', 'retiro'])
+        requested_areas_clean = [n.strip() for n in neigh_raw.split(",")]
+
+        area_conditions = []
+        for area in requested_areas_clean:
+            # 2. Try matching the exact case (e.g., 'Salamanca')
+            area_conditions.append({"district": area})
+
+            # 3. Also try Title Case for robustness (e.g., 'Salamanca')
+            area_conditions.append({"district": area.title()})
+
+            # 4. Also try lowercase (just in case the indexer lowercased it)
+            area_conditions.append({"district": area.lower()})
+
+        if area_conditions:
+            # We use an OR clause to accept ANY of the requested areas in ANY of the casings
+            chroma_filter = {"$or": area_conditions}
+
+    # Print the filter object for final verification
+    print(f"[DEBUG] Chroma Filter Object: {chroma_filter}")
+
+    # 1) Retrieve from Chroma (semantic + structured filter)
+    print("[APT] Step 1: Retrieving apartments from Chroma with District/Neighborhood filter...")
     try:
         apt_res = apts_collection.query(
             query_embeddings=embed_query(apt_query),
-            n_results=5,  # more candidates, LLM will rank
+            # 🎯 Key Change: Use a reasonable number like 15 to control token usage
+            n_results=5,
+            # Inject the filter here
+            where=chroma_filter if chroma_filter else None,
         )
     except Exception as e:
         return f"ERROR: Chroma query failed: {e}"
 
     if not apt_res["documents"]:
-        return "No apartments found in database."
+        return "No apartments found matching both the filter and the semantic query."
 
     apt_docs = apt_res["documents"][0]
     apt_metas = apt_res["metadatas"][0]
+
+    # 🎯 DEBUG PRINT A: Check how many docs were retrieved
+    print(f"[DEBUG] Retrieved {len(apt_docs)} apartments from Chroma.")
+
+    # 🎯 DEBUG PRINT B: Check metadata of the first document to verify filtering
+    if apt_metas:
+        first_meta = apt_metas[0]
+        print(
+            f"[DEBUG] First apartment meta (Neighborhood, District): {first_meta.get('neighborhood')}, {first_meta.get('district')}")
+    else:
+        print("[DEBUG] No metadata available for retrieved documents.")
 
     # NEW: summarize the descriptions using your local LM Studio model
     summarized_docs = []
@@ -461,7 +502,14 @@ def recommend_apartments(user_query: str, top_k: int = 3) -> str:
 
     # Important: this scoring prompt is GENERIC, not hard-coded to Salamanca, etc.
     score_prompt = f"""
-    You are evaluating a list of apartments for the user.
+You MUST output ONLY valid JSON. 
+No commentary, no markdown, no explanations, no text before or after.
+If quotes appear inside strings, ESCAPE them.
+Never insert newlines inside JSON strings.
+Never add trailing commas.
+Never invent metadata that is not explicitly provided.
+
+You are evaluating a list of apartments for the user.
 
 USER REQUIREMENTS:
 Structured:
@@ -470,55 +518,62 @@ Structured:
 {exterior_clause}
 {lift_clause}
 
-
-Unstructured preferences (soft filters — never treat as hard constraints):
+Unstructured preferences (soft filters — soft only):
 {soft_prefs_list}
 
-INSTRUCTIONS:
-You MUST:
-- Only use the apartments listed below.
-- Score each apartment strictly from its provided metadata and description.
-- NEVER assume missing features.
-- NEVER add features that are not explicitly written.
-- Penalize missing information instead of inventing.
-- Output only valid JSON following the required schema.
-
-SSCORING RULES (0–10):
-
-NEIGHBORHOOD MATCHING:
-- The user may specify one or multiple neighborhoods/districts.
-- +2 if the apartment's neighborhood matches ANY of them (case-insensitive).
-- +1 if the district matches but neighborhood does not explicitly match.
-- 0 if unrelated.
-
-OTHER RULES:
+SCORING RULES (0–10 total):
 - +2 fits budget
-- +2 exterior / good light / views
-- +2 lift if requested
-- +2 if the description contains any soft preferences ("quiet", "nice views", etc.)
+- +2 exterior / light / views
+- +2 lift if required
+- +2 if description contains soft preferences
+- Neighborhood match:
+    - +2 if neighborhood matches ANY preferred neighborhoods
+    - +1 if district matches but neighborhood doesn’t
+    - +0 otherwise
 
+OUTPUT FORMAT (STRICT JSON):
+{{
+  "apartments": [
+    {{
+      "property_code": "code_here",
+      "total_score": number_here,
+      "reasoning": "short explanation, 1–2 sentences max"
+    }}
+  ]
+}}
 
-OUTPUT FORMAT (strict JSON):
-Return an object with a key "apartments" containing an array of objects.
-Each object must have:
-- "property_code" (string, exactly as shown in the context)
-- "total_score" (number)
-- "reasoning" (short explanation, 1–2 sentences)
-
+The array MUST include one object per apartment.
 
 APARTMENTS TO EVALUATE:
 {apt_context}
 """
+    print(score_prompt)
 
+    # --- Step 2: Ask Gemini for JSON scoring ---
     score_raw = run_gemini(score_prompt, json_schema=apartment_score_schema)
     if score_raw.startswith("ERROR"):
         return score_raw
 
+    # --- Step 3: Sanitize Gemini mistakes BEFORE parsing ---
+    cleaned = score_raw.strip()
+    cleaned = cleaned.replace("\n", " ").replace("\t", " ")
+
+    # Remove trailing commas (common Gemini issue)
+    cleaned = re.sub(r",\s*}", "}", cleaned)
+    cleaned = re.sub(r",\s*]", "]", cleaned)
+
+    # Remove accidental spaces after/before quotes
+    cleaned = re.sub(r'"\s+', '"', cleaned)
+    cleaned = re.sub(r'\s+"', '"', cleaned)
+
+    # Use your existing helper to remove markdown fences etc.
+    cleaned = clean_json(cleaned)
+
+    # --- Step 4: Parse JSON safely ---
     try:
-        score_raw = clean_json(score_raw)
-        scores = json.loads(score_raw)
+        scores = json.loads(cleaned)
     except Exception as e:
-        return f"ERROR: Failed to parse apartment scores JSON: {e}\nRaw: {score_raw}"
+        return f"ERROR: Failed to parse apartment scores JSON: {e}\nRaw: {cleaned}"
 
     scored_list = scores.get("apartments") or []
     if not scored_list:
@@ -630,6 +685,7 @@ CANDIDATES:
 {stu_context}
 """
 
+
     def parse_student_scores(text: str) -> List[Dict[str, Any]]:
         results = []
         for line in text.splitlines():
@@ -676,7 +732,7 @@ CANDIDATES:
 # ======================================================
 # 7. MANUAL TESTS
 # ======================================================
-
+"""
 if __name__ == "__main__":
     apt_q = (
         "I want a flat to rent in Madrid, ideally in Salamanca or Retiro, "
@@ -693,3 +749,13 @@ if __name__ == "__main__":
     )
     print("\n--- Testing roommate recommendation ---")
     print(recommend_roommates(rm_q, top_k=3))
+"""
+
+if __name__ == "__main__":
+    apt_q = (
+        "I want a flat to rent in Madrid, ideally in Salamanca or Retiro, "
+        "around 1500€ per person with 2 roommates (so 3 people total). "
+        "I care about quiet streets and nice views, and I prefer exterior with lift."
+    )
+    print("--- Testing apartment recommendation ---")
+    print(recommend_apartments(apt_q, top_k=3))
